@@ -160,11 +160,71 @@ def health():
 # >>> TEMPORÁRIO: publish SEM token para destravar o TREA v3.2.5 <<<
 @app.post("/api/v1/events/publish")
 def publish():
+    """
+    Recebe JSON do TREA. Parser robusto + retorno com diagnóstico quando falhar.
+    """
     try:
-        evt = parse_json_body()
-        validate_event(evt)
-        evt_id = STORE.add(evt)
+        # --- Captura corpo bruto uma vez (cache=True permite reuso) ---
+        raw_bytes = request.get_data(cache=True)
+        ct = request.headers.get("Content-Type", "")
+
+        # 1) Tentativa padrão do Flask
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            # 2) Tenta decodificar manualmente (utf-8, depois latin-1)
+            text = None
+            try:
+                text = raw_bytes.decode("utf-8")
+            except Exception:
+                try:
+                    text = raw_bytes.decode("latin-1")
+                except Exception:
+                    text = None
+
+            if text:
+                # tenta JSON direto
+                try:
+                    obj = json.loads(text)
+                    # alguns clientes enviam string contendo outro JSON
+                    if isinstance(obj, str):
+                        obj2 = json.loads(obj)
+                        if isinstance(obj2, dict):
+                            data = obj2
+                    elif isinstance(obj, dict):
+                        data = obj
+                except Exception:
+                    # 3) tenta extrair de form-urlencoded: json=... / data=...
+                    if request.form:
+                        for k in ("json", "data", "body"):
+                            if k in request.form:
+                                try:
+                                    obj = json.loads(request.form[k])
+                                    if isinstance(obj, dict):
+                                        data = obj
+                                        break
+                                except Exception:
+                                    pass
+
+        # Se ainda não virou dict, responde 400 com diagnóstico
+        if not isinstance(data, dict):
+            return (
+                jsonify({
+                    "ok": False,
+                    "error": "Body must be a JSON object",
+                    "diag": {
+                        "content_type": ct,
+                        "raw_len": len(raw_bytes),
+                        "raw_preview": (raw_bytes[:200].decode("latin-1", "ignore") if raw_bytes else "")
+                    }
+                }),
+                400,
+            )
+
+        # Validação e persistência
+        validate_event(data)
+        evt_id = STORE.add(data)
         return jsonify({"ok": True, "id": evt_id}), 200
+
     except ValueError as ve:
         return jsonify({"ok": False, "error": str(ve)}), 400
     except Exception as e:
@@ -188,4 +248,5 @@ def stream_ndjson():
 # ======================== Main ============================
 if __name__ == "__main__":
     app.run(host=HOST, port=PORT, threaded=True)
+
 
