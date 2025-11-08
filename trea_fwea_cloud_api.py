@@ -161,64 +161,79 @@ def health():
 @app.post("/api/v1/events/publish")
 def publish():
     """
-    Recebe JSON do TREA. Parser robusto + retorno com diagnóstico quando falhar.
+    Recebe JSON do TREA. Parser ultra tolerante para MT5:
+    - aceita header errado (x-www-form-urlencoded)
+    - tenta JSON padrão
+    - tenta JSON em string
+    - recorta JSON do raw entre o primeiro '{' e o último '}' (sanitização)
+    - remove nulos, BOM e caracteres não imprimíveis nas bordas
+    Retorna diagnóstico em caso de falha.
     """
     try:
-        # --- Captura corpo bruto uma vez (cache=True permite reuso) ---
-        raw_bytes = request.get_data(cache=True)
         ct = request.headers.get("Content-Type", "")
+        raw_bytes = request.get_data(cache=True)
 
-        # 1) Tentativa padrão do Flask
+        def _clean_bytes(b: bytes) -> str:
+            # remove BOM, nulos e normaliza para texto
+            if not b:
+                return ""
+            s = b.decode("utf-8", errors="ignore")
+            s = s.replace("\ufeff", "").replace("\x00", "")
+            # tira espaços/brancos nas pontas
+            return s.strip()
+
+        # 1) tentativa padrão do Flask
         data = request.get_json(silent=True)
         if not isinstance(data, dict):
-            # 2) Tenta decodificar manualmente (utf-8, depois latin-1)
-            text = None
-            try:
-                text = raw_bytes.decode("utf-8")
-            except Exception:
-                try:
-                    text = raw_bytes.decode("latin-1")
-                except Exception:
-                    text = None
+            text = _clean_bytes(raw_bytes)
 
-            if text:
-                # tenta JSON direto
+            # 2) se for uma string JSON (com aspas escapadas), tenta duas vezes
+            def _try_json(s: str):
                 try:
-                    obj = json.loads(text)
-                    # alguns clientes enviam string contendo outro JSON
+                    obj = json.loads(s)
                     if isinstance(obj, str):
                         obj2 = json.loads(obj)
-                        if isinstance(obj2, dict):
-                            data = obj2
-                    elif isinstance(obj, dict):
-                        data = obj
+                        return obj2 if isinstance(obj2, dict) else obj
+                    return obj
                 except Exception:
-                    # 3) tenta extrair de form-urlencoded: json=... / data=...
-                    if request.form:
-                        for k in ("json", "data", "body"):
-                            if k in request.form:
-                                try:
-                                    obj = json.loads(request.form[k])
-                                    if isinstance(obj, dict):
-                                        data = obj
-                                        break
-                                except Exception:
-                                    pass
+                    return None
 
-        # Se ainda não virou dict, responde 400 com diagnóstico
+            obj = _try_json(text)
+
+            # 3) se ainda falhar, recorta a fatia entre o primeiro '{' e o último '}'
+            if not isinstance(obj, (dict, list)):
+                i, j = text.find("{"), text.rfind("}")
+                if i != -1 and j != -1 and j > i:
+                    slice_text = text[i : j + 1]
+                    obj = _try_json(slice_text)
+
+            # 4) fallback: tenta pegar de campos form 'json'/'data'/'body'
+            if not isinstance(obj, (dict, list)) and request.form:
+                for k in ("json", "data", "body"):
+                    if k in request.form:
+                        obj = _try_json(request.form[k])
+                        if isinstance(obj, (dict, list)):
+                            break
+
+            # se veio lista, aceite o primeiro elemento (caso raro)
+            if isinstance(obj, list) and obj and isinstance(obj[0], dict):
+                obj = obj[0]
+
+            if isinstance(obj, dict):
+                data = obj
+
+        # Se ainda não for dict, falha com diagnóstico detalhado
         if not isinstance(data, dict):
-            return (
-                jsonify({
-                    "ok": False,
-                    "error": "Body must be a JSON object",
-                    "diag": {
-                        "content_type": ct,
-                        "raw_len": len(raw_bytes),
-                        "raw_preview": (raw_bytes[:200].decode("latin-1", "ignore") if raw_bytes else "")
-                    }
-                }),
-                400,
-            )
+            preview = raw_bytes[:400].decode("latin-1", "ignore") if raw_bytes else ""
+            return jsonify({
+                "ok": False,
+                "error": "Body must be a JSON object",
+                "diag": {
+                    "content_type": ct,
+                    "raw_len": len(raw_bytes),
+                    "raw_preview": preview
+                }
+            }), 400
 
         # Validação e persistência
         validate_event(data)
@@ -248,5 +263,6 @@ def stream_ndjson():
 # ======================== Main ============================
 if __name__ == "__main__":
     app.run(host=HOST, port=PORT, threaded=True)
+
 
 
