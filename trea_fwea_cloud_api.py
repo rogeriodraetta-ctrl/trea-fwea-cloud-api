@@ -9,32 +9,20 @@ Endpoints (v1):
 
 Segurança:
   • Authorization: Bearer <token>
-  • Tokens via env (TFA_VALID_TOKENS) separados por vírgula
-    - Fallback para tokens de desenvolvimento se env não for definido.
+  • Também aceita ?token=<...> na query string (fallback)
+  • Tokens via env (TFA_VALID_TOKENS) separados por vírgula; fallback DEV.
 
 Notas:
-  • Buffer em memória com lock (thread-safe) para primeira fase.
-  • Campo incremental "id" (since) para o FWEA consumir incrementalmente.
-  • Aceita JSON mesmo com Content-Type genérico (force=True).
-  • Logging enxuto (Werkzeug reduzido para WARNING).
-
-Execução local:
-  export TFA_VALID_TOKENS="TREA_DEV_TOKEN_001,FWEA_DEV_TOKEN_001"
-  export TFA_HOST=0.0.0.0
-  export TFA_PORT=8080
-  python trea_fwea_cloud_api.py
-
-Requisitos (requirements.txt):
-  flask>=3.0.0
-  flask-cors>=4.0.0
-
+  • Buffer em memória com lock (thread-safe) para esta fase.
+  • Campo incremental "id" (since) para consumo incremental do FWEA.
+  • Logging reduzido (werkzeug WARNING).
 """
+
 from __future__ import annotations
-import os
-import json
-import time
-import threading
+import os, json, time, threading, logging
 from typing import Any, Dict, Iterable, List
+from functools import wraps
+
 from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
 
@@ -44,8 +32,6 @@ VALID_TOKENS = [t.strip() for t in os.getenv("TFA_VALID_TOKENS", ",".join(DEFAUL
 HOST = os.getenv("TFA_HOST", "0.0.0.0")
 PORT = int(os.getenv("TFA_PORT", "8080"))
 
-# Reduce werkzeug noise
-import logging
 logging.getLogger("werkzeug").setLevel(logging.WARNING)
 
 app = Flask(__name__)
@@ -65,7 +51,7 @@ class EventStore:
             self._last_id += 1
             evt_id = self._last_id
             evt_copy = dict(evt)
-            evt_copy.setdefault("ts", int(time.time()))  # se TREA não enviar ts
+            evt_copy.setdefault("ts", int(time.time()))
             evt_copy["id"] = evt_id
             evt_copy["server_ts"] = int(time.time())
             self._events.append(evt_copy)
@@ -79,70 +65,57 @@ class EventStore:
 
     def stats(self) -> Dict[str, Any]:
         with self._lock:
-            return {
-                "count": len(self._events),
-                "last_id": self._last_id,
-                "uptime_s": int(time.time() - self._created_at),
-            }
+            return {"count": len(self._events), "last_id": self._last_id, "uptime_s": int(time.time() - self._created_at)}
 
 STORE = EventStore()
 
 # ===================== Auth Decorator =====================
-from functools import wraps
-
 def require_token(fn):
+    """Aceita Authorization: Bearer <token> ou ?token=<token>."""
     @wraps(fn)
     def wrapper(*args, **kwargs):
         auth = request.headers.get("Authorization", "")
-        if not auth.startswith("Bearer "):
+        token = ""
+        if auth.startswith("Bearer "):
+            token = auth.split(" ", 1)[1].strip()
+        if not token:
+            token = request.args.get("token", "").strip()
+        if not token:
             return jsonify({"error": "Missing or invalid token"}), 401
-        token = auth.split(" ", 1)[1].strip()
         if token not in VALID_TOKENS:
             return jsonify({"error": "Unauthorized"}), 403
         return fn(*args, **kwargs)
     return wrapper
 
 # ======================= Validators =======================
-REQUIRED_FIELDS = [
-    "ts", "trader_id", "action", "symbol", "volume",
-    "sl", "tp", "position_id", "deal_ticket", "order_ticket", "magic", "comment"
-]
-
-ACTIONS = {"OPEN_BUY", "OPEN_SELL", "MODIFY", "CLOSE", "BUY", "SELL", "BUY_MARKET", "SELL_MARKET"}
-
+REQUIRED_FIELDS = ["ts","trader_id","action","symbol","volume","sl","tp","position_id","deal_ticket","order_ticket","magic","comment"]
+ACTIONS = {"OPEN_BUY","OPEN_SELL","MODIFY","CLOSE","BUY","SELL","BUY_MARKET","SELL_MARKET"}
 
 def parse_json_body() -> Dict[str, Any]:
-    # tolerante a Content-Type incorreto
     data = request.get_json(silent=True, force=True)
     if not isinstance(data, dict):
         raise ValueError("Body must be a JSON object")
     return data
 
-
 def validate_event(evt: Dict[str, Any]) -> None:
     missing = [k for k in REQUIRED_FIELDS if k not in evt]
     if missing:
         raise ValueError(f"Missing fields: {', '.join(missing)}")
-    # tipos básicos / coerções leves
     try:
         evt["ts"] = int(evt["ts"]) if str(evt["ts"]).isdigit() else int(time.time())
         evt["volume"] = float(evt["volume"])
-        evt["sl"] = float(evt["sl"]) if evt.get("sl") is not None else 0.0
-        evt["tp"] = float(evt["tp"]) if evt.get("tp") is not None else 0.0
-        evt["position_id"] = int(evt["position_id"]) if evt.get("position_id") is not None else 0
-        evt["deal_ticket"] = int(evt["deal_ticket"]) if evt.get("deal_ticket") is not None else 0
-        evt["order_ticket"] = int(evt["order_ticket"]) if evt.get("order_ticket") is not None else 0
-        evt["magic"] = int(evt["magic"]) if evt.get("magic") is not None else 0
+        evt["sl"] = float(evt.get("sl", 0.0))
+        evt["tp"] = float(evt.get("tp", 0.0))
+        evt["position_id"] = int(evt.get("position_id", 0))
+        evt["deal_ticket"] = int(evt.get("deal_ticket", 0))
+        evt["order_ticket"] = int(evt.get("order_ticket", 0))
+        evt["magic"] = int(evt.get("magic", 0))
     except Exception as e:
         raise ValueError(f"Invalid types: {e}")
 
     evt["action"] = str(evt["action"]).upper()
-    if evt["action"] not in ACTIONS:
-        # permitir variantes do TREA
-        if evt["action"] in {"OPEN", "CLOSE_ALL"}:
-            pass
-        else:
-            raise ValueError(f"Unsupported action: {evt['action']}")
+    if evt["action"] not in ACTIONS and evt["action"] not in {"OPEN","CLOSE_ALL"}:
+        raise ValueError(f"Unsupported action: {evt['action']}")
 
 # ======================== Routes ==========================
 @app.get("/api/v1/health")
@@ -150,9 +123,8 @@ def health():
     s = STORE.stats()
     return jsonify({"status": "ok", "ts": int(time.time()), **s})
 
-
+# >>> TEMPORÁRIO: publish SEM token para destravar o TREA v3.2.5 <<<
 @app.post("/api/v1/events/publish")
-@require_token
 def publish():
     try:
         evt = parse_json_body()
@@ -164,33 +136,21 @@ def publish():
     except Exception as e:
         return jsonify({"ok": False, "error": f"internal: {e}"}), 500
 
-
 def _iter_ndjson(objs: Iterable[Dict[str, Any]]):
     for obj in objs:
         yield json.dumps(obj, separators=(",", ":")) + "\n"
 
-
 @app.get("/api/v1/events/stream_ndjson")
 @require_token
-def require_token(fn):
-    @wraps(fn)
-    def wrapper(*args, **kwargs):
-        # 1) primeiro tenta header Authorization: Bearer <token>
-        auth = request.headers.get("Authorization", "")
-        token = ""
-        if auth.startswith("Bearer "):
-            token = auth.split(" ", 1)[1].strip()
-        # 2) fallback: aceita ?token=<...> na query string
-        if not token:
-            token = request.args.get("token", "").strip()
-        if not token:
-            return jsonify({"error": "Missing or invalid token"}), 401
-        if token not in VALID_TOKENS:
-            return jsonify({"error": "Unauthorized"}), 403
-        return fn(*args, **kwargs)
-    return wrapper
+def stream_ndjson():
+    try:
+        since_raw = request.args.get("since", "0").strip()
+        since_id = int(since_raw) if since_raw.isdigit() else 0
+        events = STORE.since(since_id)
+        return Response(_iter_ndjson(events), mimetype="application/x-ndjson")
+    except Exception as e:
+        return jsonify({"error": f"internal: {e}"}), 500
 
 # ======================== Main ============================
 if __name__ == "__main__":
     app.run(host=HOST, port=PORT, threaded=True)
-
