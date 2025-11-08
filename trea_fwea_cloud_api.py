@@ -65,13 +65,17 @@ class EventStore:
 
     def stats(self) -> Dict[str, Any]:
         with self._lock:
-            return {"count": len(self._events), "last_id": self._last_id, "uptime_s": int(time.time() - self._created_at)}
+            return {
+                "count": len(self._events),
+                "last_id": self._last_id,
+                "uptime_s": int(time.time() - self._created_at)
+            }
 
 STORE = EventStore()
 
-# ===================== Auth Decorator =====================
-def require_token(fn):
-    """Aceita Authorization: Bearer <token> ou ?token=<token>."""
+# ===================== Auth (flexível) ====================
+def require_token_flexible(fn):
+    """Aceita Authorization: Bearer <token> OU ?token=<token>."""
     @wraps(fn)
     def wrapper(*args, **kwargs):
         auth = request.headers.get("Authorization", "")
@@ -88,7 +92,10 @@ def require_token(fn):
     return wrapper
 
 # ======================= Validators =======================
-REQUIRED_FIELDS = ["ts","trader_id","action","symbol","volume","sl","tp","position_id","deal_ticket","order_ticket","magic","comment"]
+REQUIRED_FIELDS = [
+    "ts","trader_id","action","symbol","volume","sl","tp",
+    "position_id","deal_ticket","order_ticket","magic","comment"
+]
 ACTIONS = {"OPEN_BUY","OPEN_SELL","MODIFY","CLOSE","BUY","SELL","BUY_MARKET","SELL_MARKET"}
 
 def parse_json_body() -> Dict[str, Any]:
@@ -98,7 +105,7 @@ def parse_json_body() -> Dict[str, Any]:
     - corpo como string JSON "duplamente serializada"
     - fallback para raw bytes e até form-urlencoded com campo 'json'/'data'
     """
-    # 1) tentativa padrão do Flask (tolerante, mas às vezes falha)
+    # 1) tentativa padrão do Flask (às vezes funciona)
     data = request.get_json(silent=True)
     if isinstance(data, dict):
         return data
@@ -108,7 +115,6 @@ def parse_json_body() -> Dict[str, Any]:
     if raw:
         try:
             obj = json.loads(raw)
-            # alguns clientes mandam string contendo um JSON
             if isinstance(obj, str):
                 obj2 = json.loads(obj)
                 if isinstance(obj2, dict):
@@ -157,73 +163,26 @@ def health():
     s = STORE.stats()
     return jsonify({"status": "ok", "ts": int(time.time()), **s})
 
-# >>> TEMPORÁRIO: publish SEM token para destravar o TREA v3.2.5 <<<
 @app.post("/api/v1/events/publish")
+@require_token_flexible
 def publish():
     """
     Recebe JSON do TREA. Parser ultra tolerante para MT5:
     - aceita header errado (x-www-form-urlencoded)
     - tenta JSON padrão
     - tenta JSON em string
-    - recorta JSON do raw entre o primeiro '{' e o último '}' (sanitização)
-    - remove nulos, BOM e caracteres não imprimíveis nas bordas
+    - recorta JSON do raw entre o primeiro '{' e o último '}' (sanitização) [já embutido em parse_json_body()]
+    - remove nulos/BOM (via decodificação tolerante)
     Retorna diagnóstico em caso de falha.
     """
     try:
         ct = request.headers.get("Content-Type", "")
         raw_bytes = request.get_data(cache=True)
 
-        def _clean_bytes(b: bytes) -> str:
-            # remove BOM, nulos e normaliza para texto
-            if not b:
-                return ""
-            s = b.decode("utf-8", errors="ignore")
-            s = s.replace("\ufeff", "").replace("\x00", "")
-            # tira espaços/brancos nas pontas
-            return s.strip()
-
-        # 1) tentativa padrão do Flask
-        data = request.get_json(silent=True)
-        if not isinstance(data, dict):
-            text = _clean_bytes(raw_bytes)
-
-            # 2) se for uma string JSON (com aspas escapadas), tenta duas vezes
-            def _try_json(s: str):
-                try:
-                    obj = json.loads(s)
-                    if isinstance(obj, str):
-                        obj2 = json.loads(obj)
-                        return obj2 if isinstance(obj2, dict) else obj
-                    return obj
-                except Exception:
-                    return None
-
-            obj = _try_json(text)
-
-            # 3) se ainda falhar, recorta a fatia entre o primeiro '{' e o último '}'
-            if not isinstance(obj, (dict, list)):
-                i, j = text.find("{"), text.rfind("}")
-                if i != -1 and j != -1 and j > i:
-                    slice_text = text[i : j + 1]
-                    obj = _try_json(slice_text)
-
-            # 4) fallback: tenta pegar de campos form 'json'/'data'/'body'
-            if not isinstance(obj, (dict, list)) and request.form:
-                for k in ("json", "data", "body"):
-                    if k in request.form:
-                        obj = _try_json(request.form[k])
-                        if isinstance(obj, (dict, list)):
-                            break
-
-            # se veio lista, aceite o primeiro elemento (caso raro)
-            if isinstance(obj, list) and obj and isinstance(obj[0], dict):
-                obj = obj[0]
-
-            if isinstance(obj, dict):
-                data = obj
-
-        # Se ainda não for dict, falha com diagnóstico detalhado
-        if not isinstance(data, dict):
+        # tenta parse robusto
+        try:
+            data = parse_json_body()
+        except ValueError:
             preview = raw_bytes[:400].decode("latin-1", "ignore") if raw_bytes else ""
             return jsonify({
                 "ok": False,
@@ -235,7 +194,6 @@ def publish():
                 }
             }), 400
 
-        # Validação e persistência
         validate_event(data)
         evt_id = STORE.add(data)
         return jsonify({"ok": True, "id": evt_id}), 200
@@ -250,7 +208,7 @@ def _iter_ndjson(objs: Iterable[Dict[str, Any]]):
         yield json.dumps(obj, separators=(",", ":")) + "\n"
 
 @app.get("/api/v1/events/stream_ndjson")
-@require_token
+@require_token_flexible
 def stream_ndjson():
     try:
         since_raw = request.args.get("since", "0").strip()
@@ -263,6 +221,3 @@ def stream_ndjson():
 # ======================== Main ============================
 if __name__ == "__main__":
     app.run(host=HOST, port=PORT, threaded=True)
-
-
-
