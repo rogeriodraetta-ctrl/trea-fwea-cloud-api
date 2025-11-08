@@ -92,10 +92,44 @@ REQUIRED_FIELDS = ["ts","trader_id","action","symbol","volume","sl","tp","positi
 ACTIONS = {"OPEN_BUY","OPEN_SELL","MODIFY","CLOSE","BUY","SELL","BUY_MARKET","SELL_MARKET"}
 
 def parse_json_body() -> Dict[str, Any]:
-    data = request.get_json(silent=True, force=True)
-    if not isinstance(data, dict):
-        raise ValueError("Body must be a JSON object")
-    return data
+    """
+    Parser robusto para aceitar variações do MT5:
+    - JSON com Content-Type incorreto
+    - corpo como string JSON "duplamente serializada"
+    - fallback para raw bytes e até form-urlencoded com campo 'json'/'data'
+    """
+    # 1) tentativa padrão do Flask (tolerante, mas às vezes falha)
+    data = request.get_json(silent=True)
+    if isinstance(data, dict):
+        return data
+
+    # 2) lê o corpo bruto como texto (UTF-8) e tenta json.loads
+    raw = request.get_data(cache=False, as_text=True)
+    if raw:
+        try:
+            obj = json.loads(raw)
+            # alguns clientes mandam string contendo um JSON
+            if isinstance(obj, str):
+                obj2 = json.loads(obj)
+                if isinstance(obj2, dict):
+                    return obj2
+            if isinstance(obj, dict):
+                return obj
+        except Exception:
+            pass
+
+    # 3) fallback: tenta extrair de form-urlencoded (ex: json=<...> ou data=<...>)
+    try:
+        if request.form:
+            for key in ("json", "data", "body"):
+                if key in request.form:
+                    obj = json.loads(request.form[key])
+                    if isinstance(obj, dict):
+                        return obj
+    except Exception:
+        pass
+
+    raise ValueError("Body must be a JSON object")
 
 def validate_event(evt: Dict[str, Any]) -> None:
     missing = [k for k in REQUIRED_FIELDS if k not in evt]
@@ -154,3 +188,4 @@ def stream_ndjson():
 # ======================== Main ============================
 if __name__ == "__main__":
     app.run(host=HOST, port=PORT, threaded=True)
+
