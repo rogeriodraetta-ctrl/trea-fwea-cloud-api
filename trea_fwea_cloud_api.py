@@ -172,17 +172,25 @@ def _iter_ndjson(objs: Iterable[Dict[str, Any]]):
 
 @app.get("/api/v1/events/stream_ndjson")
 @require_token
-def stream_ndjson():
-    # since pode vir como id incremental; default 0
-    raw = request.args.get("since", "0").strip()
-    try:
-        since_id = int(raw)
-    except Exception:
-        since_id = 0
-    evts = STORE.since(since_id)
-    return Response(_iter_ndjson(evts), mimetype="application/x-ndjson")
-
+def require_token(fn):
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        # 1) primeiro tenta header Authorization: Bearer <token>
+        auth = request.headers.get("Authorization", "")
+        token = ""
+        if auth.startswith("Bearer "):
+            token = auth.split(" ", 1)[1].strip()
+        # 2) fallback: aceita ?token=<...> na query string
+        if not token:
+            token = request.args.get("token", "").strip()
+        if not token:
+            return jsonify({"error": "Missing or invalid token"}), 401
+        if token not in VALID_TOKENS:
+            return jsonify({"error": "Unauthorized"}), 403
+        return fn(*args, **kwargs)
+    return wrapper
 
 # ======================== Main ============================
 if __name__ == "__main__":
     app.run(host=HOST, port=PORT, threaded=True)
+
