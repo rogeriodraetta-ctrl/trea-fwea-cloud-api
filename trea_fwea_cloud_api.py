@@ -164,26 +164,81 @@ def health():
     return jsonify({"status": "ok", "ts": int(time.time()), **s})
 
 @app.post("/api/v1/events/publish")
-@require_token_flexible
 def publish():
     """
     Recebe JSON do TREA. Parser ultra tolerante para MT5:
     - aceita header errado (x-www-form-urlencoded)
-    - tenta JSON padrão
-    - tenta JSON em string
-    - recorta JSON do raw entre o primeiro '{' e o último '}' (sanitização) [já embutido em parse_json_body()]
-    - remove nulos/BOM (via decodificação tolerante)
+    - remove BOM e byte nulo (\x00)
+    - tenta JSON direto; se falhar, recorta entre { e } e tenta de novo
+    - fallback para campos form ('json'/'data'/'body')
     Retorna diagnóstico em caso de falha.
     """
     try:
         ct = request.headers.get("Content-Type", "")
-        raw_bytes = request.get_data(cache=True)
+        raw_bytes = request.get_data(cache=False)  # sem cache para pegar o corpo exato
 
-        # tenta parse robusto
+        def _clean_text(b: bytes) -> str:
+            if not b:
+                return ""
+            s = b.decode("utf-8", errors="ignore")
+            # remove BOM e byte nulo do MT5
+            s = s.replace("\ufeff", "").replace("\x00", "")
+            return s.strip()
+
+        text = _clean_text(raw_bytes)
+        data = None
+
+        # 1) tenta via get_json forçado (independe do Content-Type)
         try:
-            data = parse_json_body()
-        except ValueError:
-            preview = raw_bytes[:400].decode("latin-1", "ignore") if raw_bytes else ""
+            gj = request.get_json(force=True, silent=True)
+            if isinstance(gj, dict):
+                data = gj
+        except Exception:
+            pass
+
+        # 2) tenta carregar o texto inteiro como JSON
+        if data is None and text:
+            try:
+                obj = json.loads(text)
+                # alguns clientes mandam string contendo um JSON
+                if isinstance(obj, str):
+                    obj2 = json.loads(obj)
+                    if isinstance(obj2, dict):
+                        data = obj2
+                elif isinstance(obj, dict):
+                    data = obj
+            except Exception:
+                pass
+
+        # 3) recorta entre o 1º '{' e o último '}' e tenta novamente
+        if data is None and text:
+            i, j = text.find("{"), text.rfind("}")
+            if i != -1 and j != -1 and j > i:
+                slice_text = text[i:j+1]
+                try:
+                    obj = json.loads(slice_text)
+                    if isinstance(obj, dict):
+                        data = obj
+                except Exception:
+                    pass
+
+        # 4) fallback: form-urlencoded com campos 'json'/'data'/'body'
+        if data is None and request.form:
+            for k in ("json", "data", "body"):
+                v = request.form.get(k, "")
+                v = v.replace("\ufeff", "").replace("\x00", "").strip()
+                if not v:
+                    continue
+                try:
+                    obj = json.loads(v)
+                    if isinstance(obj, dict):
+                        data = obj
+                        break
+                except Exception:
+                    continue
+
+        if not isinstance(data, dict):
+            preview = (raw_bytes[:400].decode("latin-1", "ignore") if raw_bytes else "")
             return jsonify({
                 "ok": False,
                 "error": "Body must be a JSON object",
@@ -194,6 +249,7 @@ def publish():
                 }
             }), 400
 
+        # valida e persiste
         validate_event(data)
         evt_id = STORE.add(data)
         return jsonify({"ok": True, "id": evt_id}), 200
@@ -221,3 +277,4 @@ def stream_ndjson():
 # ======================== Main ============================
 if __name__ == "__main__":
     app.run(host=HOST, port=PORT, threaded=True)
+
