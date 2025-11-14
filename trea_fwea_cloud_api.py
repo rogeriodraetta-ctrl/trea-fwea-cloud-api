@@ -28,7 +28,11 @@ from flask_cors import CORS
 
 # ========================= Config =========================
 DEFAULT_TOKENS = ["TREA_DEV_TOKEN_001", "FWEA_DEV_TOKEN_001"]
-VALID_TOKENS = [t.strip() for t in os.getenv("TFA_VALID_TOKENS", ",".join(DEFAULT_TOKENS)).split(",") if t.strip()]
+VALID_TOKENS = [
+    t.strip()
+    for t in os.getenv("TFA_VALID_TOKENS", ",".join(DEFAULT_TOKENS)).split(",")
+    if t.strip()
+]
 HOST = os.getenv("TFA_HOST", "0.0.0.0")
 PORT = int(os.getenv("TFA_PORT", "8080"))
 
@@ -47,6 +51,7 @@ class EventStore:
         self._created_at = time.time()
 
     def add(self, evt: Dict[str, Any]) -> int:
+        """Adiciona evento com id incremental, preservando 'ts' se vier do TREA."""
         with self._lock:
             self._last_id += 1
             evt_id = self._last_id
@@ -58,18 +63,26 @@ class EventStore:
             return evt_id
 
     def since(self, since_id: int) -> List[Dict[str, Any]]:
+        """
+        Retorna eventos com id > since_id, sempre ordenados por id crescente.
+        Isso garante monotonicidade para o consumidor (FWEA).
+        """
         with self._lock:
             if since_id <= 0:
-                return list(self._events)
-            return [e for e in self._events if e.get("id", 0) > since_id]
+                events = list(self._events)
+            else:
+                events = [e for e in self._events if e.get("id", 0) > since_id]
+            events.sort(key=lambda e: e.get("id", 0))
+            return events
 
     def stats(self) -> Dict[str, Any]:
         with self._lock:
             return {
                 "count": len(self._events),
                 "last_id": self._last_id,
-                "uptime_s": int(time.time() - self._created_at)
+                "uptime_s": int(time.time() - self._created_at),
             }
+
 
 STORE = EventStore()
 
@@ -93,10 +106,30 @@ def require_token_flexible(fn):
 
 # ======================= Validators =======================
 REQUIRED_FIELDS = [
-    "ts","trader_id","action","symbol","volume","sl","tp",
-    "position_id","deal_ticket","order_ticket","magic","comment"
+    "ts",
+    "trader_id",
+    "action",
+    "symbol",
+    "volume",
+    "sl",
+    "tp",
+    "position_id",
+    "deal_ticket",
+    "order_ticket",
+    "magic",
+    "comment",
 ]
-ACTIONS = {"OPEN_BUY","OPEN_SELL","MODIFY","CLOSE","BUY","SELL","BUY_MARKET","SELL_MARKET"}
+ACTIONS = {
+    "OPEN_BUY",
+    "OPEN_SELL",
+    "MODIFY",
+    "CLOSE",
+    "BUY",
+    "SELL",
+    "BUY_MARKET",
+    "SELL_MARKET",
+}
+
 
 def parse_json_body() -> Dict[str, Any]:
     """
@@ -137,6 +170,7 @@ def parse_json_body() -> Dict[str, Any]:
 
     raise ValueError("Body must be a JSON object")
 
+
 def validate_event(evt: Dict[str, Any]) -> None:
     missing = [k for k in REQUIRED_FIELDS if k not in evt]
     if missing:
@@ -154,14 +188,16 @@ def validate_event(evt: Dict[str, Any]) -> None:
         raise ValueError(f"Invalid types: {e}")
 
     evt["action"] = str(evt["action"]).upper()
-    if evt["action"] not in ACTIONS and evt["action"] not in {"OPEN","CLOSE_ALL"}:
+    if evt["action"] not in ACTIONS and evt["action"] not in {"OPEN", "CLOSE_ALL"}:
         raise ValueError(f"Unsupported action: {evt['action']}")
+
 
 # ======================== Routes ==========================
 @app.get("/api/v1/health")
 def health():
     s = STORE.stats()
     return jsonify({"status": "ok", "ts": int(time.time()), **s})
+
 
 @app.post("/api/v1/events/publish")
 def publish():
@@ -214,7 +250,7 @@ def publish():
         if data is None and text:
             i, j = text.find("{"), text.rfind("}")
             if i != -1 and j != -1 and j > i:
-                slice_text = text[i:j+1]
+                slice_text = text[i : j + 1]
                 try:
                     obj = json.loads(slice_text)
                     if isinstance(obj, dict):
@@ -238,16 +274,23 @@ def publish():
                     continue
 
         if not isinstance(data, dict):
-            preview = (raw_bytes[:400].decode("latin-1", "ignore") if raw_bytes else "")
-            return jsonify({
-                "ok": False,
-                "error": "Body must be a JSON object",
-                "diag": {
-                    "content_type": ct,
-                    "raw_len": len(raw_bytes),
-                    "raw_preview": preview
-                }
-            }), 400
+            preview = (
+                raw_bytes[:400].decode("latin-1", "ignore") if raw_bytes else ""
+            )
+            return (
+                jsonify(
+                    {
+                        "ok": False,
+                        "error": "Body must be a JSON object",
+                        "diag": {
+                            "content_type": ct,
+                            "raw_len": len(raw_bytes),
+                            "raw_preview": preview,
+                        },
+                    }
+                ),
+                400,
+            )
 
         # valida e persiste
         validate_event(data)
@@ -259,9 +302,11 @@ def publish():
     except Exception as e:
         return jsonify({"ok": False, "error": f"internal: {e}"}), 500
 
+
 def _iter_ndjson(objs: Iterable[Dict[str, Any]]):
     for obj in objs:
         yield json.dumps(obj, separators=(",", ":")) + "\n"
+
 
 @app.get("/api/v1/events/stream_ndjson")
 @require_token_flexible
@@ -274,7 +319,7 @@ def stream_ndjson():
     except Exception as e:
         return jsonify({"error": f"internal: {e}"}), 500
 
+
 # ======================== Main ============================
 if __name__ == "__main__":
     app.run(host=HOST, port=PORT, threaded=True)
-
