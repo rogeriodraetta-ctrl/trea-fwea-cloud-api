@@ -184,13 +184,19 @@ def validate_event(evt: Dict[str, Any]) -> None:
         evt["deal_ticket"] = int(evt.get("deal_ticket", 0))
         evt["order_ticket"] = int(evt.get("order_ticket", 0))
         evt["magic"] = int(evt.get("magic", 0))
+
+        # NOVO: campos opcionais de proporcionalidade vindos do TREA
+        if "acc_balance" in evt:
+            evt["acc_balance"] = float(evt["acc_balance"])
+        if "acc_equity" in evt:
+            evt["acc_equity"] = float(evt["acc_equity"])
+
     except Exception as e:
         raise ValueError(f"Invalid types: {e}")
 
     evt["action"] = str(evt["action"]).upper()
     if evt["action"] not in ACTIONS and evt["action"] not in {"OPEN", "CLOSE_ALL"}:
         raise ValueError(f"Unsupported action: {evt['action']}")
-
 
 # ======================== Routes ==========================
 @app.get("/api/v1/health")
