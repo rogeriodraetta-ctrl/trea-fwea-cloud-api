@@ -185,6 +185,9 @@ def validate_event(evt: Dict[str, Any]) -> None:
         evt["order_ticket"] = int(evt.get("order_ticket", 0))
         evt["magic"] = int(evt.get("magic", 0))
 
+        # Opcional: SEQ do TREA (monotônico por origem)
+        if "seq" in evt:
+            evt["seq"] = int(evt.get("seq", 0))
         # NOVO: campos opcionais de proporcionalidade vindos do TREA
         if "acc_balance" in evt:
             evt["acc_balance"] = float(evt["acc_balance"])
@@ -329,3 +332,4 @@ def stream_ndjson():
 # ======================== Main ============================
 if __name__ == "__main__":
     app.run(host=HOST, port=PORT, threaded=True)
+
