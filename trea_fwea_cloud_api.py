@@ -43,15 +43,52 @@ CORS(app, supports_credentials=False)
 
 # ========================= Storage ========================
 class EventStore:
-    """Thread-safe in-memory store com id incremental e stats."""
-    def __init__(self) -> None:
+    """
+    Thread-safe store com id incremental + persistência simples (JSONL).
+    Nesta fase, persistimos todos os eventos em arquivo para evitar reset de id/seq em restart.
+    """
+    def __init__(self, persist_path: str = "") -> None:
         self._lock = threading.RLock()
         self._events: List[Dict[str, Any]] = []
         self._last_id = 0
         self._created_at = time.time()
+        self._persist_path = persist_path.strip()
+        if self._persist_path:
+            self._load_from_disk()
+
+    def _load_from_disk(self) -> None:
+        try:
+            if not os.path.exists(self._persist_path):
+                return
+            with open(self._persist_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        evt = json.loads(line)
+                        if isinstance(evt, dict):
+                            self._events.append(evt)
+                            self._last_id = max(self._last_id, int(evt.get("id", 0) or 0))
+                    except Exception:
+                        continue
+            # garante ordenação por id após load
+            self._events.sort(key=lambda e: int(e.get("id", 0) or 0))
+        except Exception as e:
+            logging.warning("EventStore: falha ao carregar persistência: %s", e)
+
+    def _append_to_disk(self, evt: Dict[str, Any]) -> None:
+        if not self._persist_path:
+            return
+        try:
+            os.makedirs(os.path.dirname(self._persist_path) or ".", exist_ok=True)
+            with open(self._persist_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(evt, ensure_ascii=False) + "\n")
+        except Exception as e:
+            logging.warning("EventStore: falha ao persistir evento: %s", e)
 
     def add(self, evt: Dict[str, Any]) -> int:
-        """Adiciona evento com id incremental, preservando 'ts' se vier do TREA."""
+        """Adiciona evento com id incremental, preservando 'ts' e 'seq' se vierem do TREA."""
         with self._lock:
             self._last_id += 1
             evt_id = self._last_id
@@ -60,20 +97,53 @@ class EventStore:
             evt_copy["id"] = evt_id
             evt_copy["server_ts"] = int(time.time())
             self._events.append(evt_copy)
+            self._append_to_disk(evt_copy)
             return evt_id
 
     def since(self, since_id: int) -> List[Dict[str, Any]]:
         """
         Retorna eventos com id > since_id, sempre ordenados por id crescente.
-        Isso garante monotonicidade para o consumidor (FWEA).
+        Mantido por compatibilidade (API legada).
         """
         with self._lock:
             if since_id <= 0:
                 events = list(self._events)
             else:
-                events = [e for e in self._events if e.get("id", 0) > since_id]
-            events.sort(key=lambda e: e.get("id", 0))
+                events = [e for e in self._events if int(e.get("id", 0) or 0) > since_id]
+            events.sort(key=lambda e: int(e.get("id", 0) or 0))
             return events
+
+    def since_seq(self, trader_key: str, since_seq: int) -> List[Dict[str, Any]]:
+        """
+        Retorna eventos com seq > since_seq para um trader_key específico,
+        ordenados por (seq, id). Este é o cursor definitivo (Opção B).
+        """
+        tk = (trader_key or "").strip()
+        if not tk:
+            return []
+        with self._lock:
+            out = []
+            for e in self._events:
+                if e.get("trader_key") != tk:
+                    continue
+                s = int(e.get("seq", 0) or 0)
+                if s > since_seq:
+                    out.append(e)
+            out.sort(key=lambda e: (int(e.get("seq", 0) or 0), int(e.get("id", 0) or 0)))
+            return out
+
+    def last_seq_by_trader(self, limit: int = 50) -> Dict[str, int]:
+        with self._lock:
+            last: Dict[str, int] = {}
+            # percorre do fim para o começo para ser rápido
+            for e in reversed(self._events):
+                tk = e.get("trader_key")
+                if not tk or tk in last:
+                    continue
+                last[tk] = int(e.get("seq", 0) or 0)
+                if len(last) >= limit:
+                    break
+            return last
 
     def stats(self) -> Dict[str, Any]:
         with self._lock:
@@ -81,10 +151,12 @@ class EventStore:
                 "count": len(self._events),
                 "last_id": self._last_id,
                 "uptime_s": int(time.time() - self._created_at),
+                "persist_path": self._persist_path if self._persist_path else "",
             }
 
 
-STORE = EventStore()
+PERSIST_PATH = os.getenv("TFA_PERSIST_PATH", "/tmp/trea_fwea_events.jsonl")
+STORE = EventStore(persist_path=PERSIST_PATH)
 
 # ===================== Auth (flexível) ====================
 def require_token_flexible(fn):
@@ -205,6 +277,8 @@ def validate_event(evt: Dict[str, Any]) -> None:
 @app.get("/api/v1/health")
 def health():
     s = STORE.stats()
+    # last_seq_by_trader ajuda diagnóstico / recovery
+    s["last_seq_by_trader"] = STORE.last_seq_by_trader(limit=50)
     return jsonify({"status": "ok", "ts": int(time.time()), **s})
 
 
@@ -320,9 +394,32 @@ def _iter_ndjson(objs: Iterable[Dict[str, Any]]):
 @app.get("/api/v1/events/stream_ndjson")
 @require_token_flexible
 def stream_ndjson():
+    """
+    NDJSON stream para o FWEA.
+
+    Compatibilidade:
+      - Legado: ?since=<id>  -> retorna eventos com id > since
+      - Novo (Opção B): ?trader_key=XXX&since_seq=YYY -> retorna eventos com seq > since_seq (ordenado por seq)
+    """
     try:
-        since_raw = request.args.get("since", "0").strip()
-        since_id = int(since_raw) if since_raw.isdigit() else 0
+        trader_key = (request.args.get("trader_key", "") or "").strip()
+        since_seq_raw = (request.args.get("since_seq", "") or "").strip()
+
+        # --- Novo cursor por SEQ ---
+        if trader_key and since_seq_raw != "":
+            try:
+                since_seq = int(since_seq_raw)
+            except Exception:
+                since_seq = 0
+            events = STORE.since_seq(trader_key, since_seq)
+            return Response(_iter_ndjson(events), mimetype="application/x-ndjson")
+
+        # --- Legado por id ---
+        since_raw = (request.args.get("since", "0") or "0").strip()
+        try:
+            since_id = int(since_raw)
+        except Exception:
+            since_id = 0
         events = STORE.since(since_id)
         return Response(_iter_ndjson(events), mimetype="application/x-ndjson")
     except Exception as e:
