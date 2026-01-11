@@ -27,7 +27,7 @@ from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
 
 # ========================= Config =========================
-DEFAULT_TOKENS = ["TREA_DEV_TOKEN_001", "FWEA_DEV_TOKEN_001"]
+DEFAULT_TOKENS = ["TREA_DEV_TOKEN_001", "FWEA_DEV_TOKEN_001", "TREA_MT5_DEV_TOKEN_001", "FWEA_MT5_DEV_TOKEN_001"]
 VALID_TOKENS = [
     t.strip()
     for t in os.getenv("TFA_VALID_TOKENS", ",".join(DEFAULT_TOKENS)).split(",")
@@ -429,4 +429,3 @@ def stream_ndjson():
 # ======================== Main ============================
 if __name__ == "__main__":
     app.run(host=HOST, port=PORT, threaded=True)
-
