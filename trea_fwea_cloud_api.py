@@ -38,7 +38,11 @@ VALID_TOKENS = [
 HOST = os.getenv("TFA_HOST", "0.0.0.0")
 PORT = int(os.getenv("TFA_PORT", "8080"))
 
-TFA_REDIS_SHADOW = os.getenv("TFA_REDIS_SHADOW", "0").strip().lower() in ("1", "true", "yes", "on")
+TFA_REDIS_SHADOW = (
+    os.getenv("REDIS_SHADOW")
+    or os.getenv("TFA_REDIS_SHADOW", "0")
+).strip().lower() in ("1", "true", "yes", "on")
+
 UPSTASH_REDIS_REST_URL = os.getenv("UPSTASH_REDIS_REST_URL", "").strip()
 UPSTASH_REDIS_REST_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN", "").strip()
 
