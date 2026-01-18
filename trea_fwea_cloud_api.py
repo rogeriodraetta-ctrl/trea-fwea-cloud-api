@@ -42,6 +42,13 @@ TFA_REDIS_SHADOW = os.getenv("TFA_REDIS_SHADOW", "0").strip().lower() in ("1", "
 UPSTASH_REDIS_REST_URL = os.getenv("UPSTASH_REDIS_REST_URL", "").strip()
 UPSTASH_REDIS_REST_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN", "").strip()
 
+logging.warning(
+    "BOOT: TFA_REDIS_SHADOW=%s UPSTASH_URL=%s TOKEN_SET=%s",
+    TFA_REDIS_SHADOW,
+    (UPSTASH_REDIS_REST_URL[:40] + "...") if UPSTASH_REDIS_REST_URL else "",
+    bool(UPSTASH_REDIS_REST_TOKEN),
+)
+
 logging.getLogger("werkzeug").setLevel(logging.WARNING)
 
 app = Flask(__name__)
@@ -334,7 +341,18 @@ def _shadow_xadd(evt: Dict[str, Any]) -> None:
         "json", evt_json,
     ]
 
+    logging.warning(
+        "REDIS_SHADOW: about to XADD stream=%s id=%s seq=%s",
+        stream, evt.get("id", 0), evt.get("seq", 0)
+    )
+
     r = _upstash_cmd(args)
+
+    logging.warning(
+        "REDIS_SHADOW: XADD result stream=%s id=%s resp=%s",
+        stream, evt.get("id", 0), r
+    )
+
     if not isinstance(r, dict) or not r.get("result"):
         logging.warning("REDIS_SHADOW: XADD failed stream=%s id=%s err=%s", stream, evt.get("id"), r)
 
