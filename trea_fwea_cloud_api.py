@@ -20,6 +20,8 @@ Notas:
 
 from __future__ import annotations
 import os, json, time, threading, logging
+import urllib.request
+import urllib.error
 from typing import Any, Dict, Iterable, List
 from functools import wraps
 
@@ -35,6 +37,10 @@ VALID_TOKENS = [
 ]
 HOST = os.getenv("TFA_HOST", "0.0.0.0")
 PORT = int(os.getenv("TFA_PORT", "8080"))
+
+TFA_REDIS_SHADOW = os.getenv("TFA_REDIS_SHADOW", "0").strip().lower() in ("1", "true", "yes", "on")
+UPSTASH_REDIS_REST_URL = os.getenv("UPSTASH_REDIS_REST_URL", "").strip()
+UPSTASH_REDIS_REST_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN", "").strip()
 
 logging.getLogger("werkzeug").setLevel(logging.WARNING)
 
@@ -87,7 +93,7 @@ class EventStore:
         except Exception as e:
             logging.warning("EventStore: falha ao persistir evento: %s", e)
 
-    def add(self, evt: Dict[str, Any]) -> int:
+    def add(self, evt: Dict[str, Any]) -> Dict[str, Any]:
         """Adiciona evento com id incremental, preservando 'ts' e 'seq' se vierem do TREA."""
         with self._lock:
             self._last_id += 1
@@ -98,7 +104,7 @@ class EventStore:
             evt_copy["server_ts"] = int(time.time())
             self._events.append(evt_copy)
             self._append_to_disk(evt_copy)
-            return evt_id
+            return evt_copy
 
     def since(self, since_id: int) -> List[Dict[str, Any]]:
         """
@@ -273,6 +279,65 @@ def validate_event(evt: Dict[str, Any]) -> None:
     if evt["action"] not in ACTIONS and evt["action"] not in {"OPEN", "CLOSE_ALL"}:
         raise ValueError(f"Unsupported action: {evt['action']}")
 
+def _upstash_cmd(args: List[str]) -> Dict[str, Any]:
+    if not UPSTASH_REDIS_REST_URL or not UPSTASH_REDIS_REST_TOKEN:
+        return {"ok": False, "error": "missing_upstash_env"}
+
+    payload = json.dumps(args).encode("utf-8")
+    req = urllib.request.Request(
+        UPSTASH_REDIS_REST_URL,
+        data=payload,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {UPSTASH_REDIS_REST_TOKEN}",
+            "Content-Type": "application/json",
+        },
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            raw = resp.read().decode("utf-8", errors="ignore")
+            return json.loads(raw)
+    except urllib.error.HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode("utf-8", errors="ignore")
+        except Exception:
+            pass
+        return {"ok": False, "error": f"http_{e.code}", "body": body[:200]}
+    except Exception as e:
+        return {"ok": False, "error": f"upstash_exc:{e}"}
+
+
+def _shadow_xadd(evt: Dict[str, Any]) -> None:
+    if not TFA_REDIS_SHADOW:
+        return
+    if not UPSTASH_REDIS_REST_URL or not UPSTASH_REDIS_REST_TOKEN:
+        return
+
+    trader_key = (evt.get("trader_key") or "").strip()
+    if not trader_key:
+        trader_key = f"trader_{evt.get('trader_id','')}".strip()
+
+    stream = f"tfa:events:{trader_key}"
+    evt_json = json.dumps(evt, ensure_ascii=False, separators=(",", ":"))
+
+    args = [
+        "XADD", stream, "*",
+        "id", str(evt.get("id", 0)),
+        "seq", str(evt.get("seq", 0)),
+        "ts", str(evt.get("ts", 0)),
+        "server_ts", str(evt.get("server_ts", 0)),
+        "action", str(evt.get("action", "")),
+        "symbol", str(evt.get("symbol", "")),
+        "position_id", str(evt.get("position_id", 0)),
+        "json", evt_json,
+    ]
+
+    r = _upstash_cmd(args)
+    if not isinstance(r, dict) or not r.get("result"):
+        logging.warning("REDIS_SHADOW: XADD failed stream=%s id=%s err=%s", stream, evt.get("id"), r)
+
 # ======================== Routes ==========================
 @app.get("/api/v1/health")
 def health():
@@ -377,8 +442,10 @@ def publish():
 
         # valida e persiste
         validate_event(data)
-        evt_id = STORE.add(data)
-        return jsonify({"ok": True, "id": evt_id}), 200
+        evt = STORE.add(data)
+        _shadow_xadd(evt)
+        return jsonify({"ok": True, "id": int(evt.get("id", 0) or 0)}), 200
+
 
     except ValueError as ve:
         return jsonify({"ok": False, "error": str(ve)}), 400
@@ -429,3 +496,4 @@ def stream_ndjson():
 # ======================== Main ============================
 if __name__ == "__main__":
     app.run(host=HOST, port=PORT, threaded=True)
+
