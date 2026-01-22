@@ -487,110 +487,56 @@ def health():
 
 
 @app.post("/api/v1/events/publish")
-def publish():
-    """
-    Recebe JSON do TREA. Parser ultra tolerante para MT5:
-    - aceita header errado (x-www-form-urlencoded)
-    - remove BOM e byte nulo (\x00)
-    - tenta JSON direto; se falhar, recorta entre { e } e tenta de novo
-    - fallback para campos form ('json'/'data'/'body')
-    Retorna diagnóstico em caso de falha.
-    """
-    try:
-        ct = request.headers.get("Content-Type", "")
-        raw_bytes = request.get_data(cache=False)  # sem cache para pegar o corpo exato
+def publish_event():
+    evt = request.get_json(force=True, silent=True) or {}
 
-        def _clean_text(b: bytes) -> str:
-            if not b:
-                return ""
-            s = b.decode("utf-8", errors="ignore")
-            # remove BOM e byte nulo do MT5
-            s = s.replace("\ufeff", "").replace("\x00", "")
-            return s.strip()
+    # --- validações mínimas ---
+    trader_key = (evt.get("trader_key") or "").strip()
+    if not trader_key:
+        return jsonify({"ok": False, "error": "missing_trader_key"}), 400
 
-        text = _clean_text(raw_bytes)
-        data = None
+    event_id = (evt.get("event_id") or "").strip()
+    if not event_id:
+        return jsonify({"ok": False, "error": "missing_event_id"}), 400
 
-        # 1) tenta via get_json forçado (independe do Content-Type)
-        try:
-            gj = request.get_json(force=True, silent=True)
-            if isinstance(gj, dict):
-                data = gj
-        except Exception:
-            pass
+    evt["server_ts"] = int(time.time())
 
-        # 2) tenta carregar o texto inteiro como JSON
-        if data is None and text:
-            try:
-                obj = json.loads(text)
-                # alguns clientes mandam string contendo um JSON
-                if isinstance(obj, str):
-                    obj2 = json.loads(obj)
-                    if isinstance(obj2, dict):
-                        data = obj2
-                elif isinstance(obj, dict):
-                    data = obj
-            except Exception:
-                pass
+    # --- Redis Streams (Fase 1) ---
+    if TFA_REDIS_STREAMS:
+        is_new = _redis_set_dedupe_if_new(trader_key, event_id)
+        if not is_new:
+            return jsonify({
+                "ok": True,
+                "duplicate": True,
+                "event_id": event_id,
+                "trader_key": trader_key
+            }), 200
 
-        # 3) recorta entre o 1º '{' e o último '}' e tenta novamente
-        if data is None and text:
-            i, j = text.find("{"), text.rfind("}")
-            if i != -1 and j != -1 and j > i:
-                slice_text = text[i : j + 1]
-                try:
-                    obj = json.loads(slice_text)
-                    if isinstance(obj, dict):
-                        data = obj
-                except Exception:
-                    pass
+        r = _redis_xadd_event(evt)
+        if not r.get("ok"):
+            return jsonify({
+                "ok": False,
+                "error": "redis_xadd_failed",
+                "detail": r
+            }), 500
 
-        # 4) fallback: form-urlencoded com campos 'json'/'data'/'body'
-        if data is None and request.form:
-            for k in ("json", "data", "body"):
-                v = request.form.get(k, "")
-                v = v.replace("\ufeff", "").replace("\x00", "").strip()
-                if not v:
-                    continue
-                try:
-                    obj = json.loads(v)
-                    if isinstance(obj, dict):
-                        data = obj
-                        break
-                except Exception:
-                    continue
+        return jsonify({
+            "ok": True,
+            "event_id": event_id,
+            "trader_key": trader_key,
+            "redis_stream": r.get("stream"),
+            "redis_id": r.get("redis_id"),
+            "server_ts": evt["server_ts"]
+        }), 200
 
-        if not isinstance(data, dict):
-            preview = (
-                raw_bytes[:400].decode("latin-1", "ignore") if raw_bytes else ""
-            )
-            return (
-                jsonify(
-                    {
-                        "ok": False,
-                        "error": "Body must be a JSON object",
-                        "diag": {
-                            "content_type": ct,
-                            "raw_len": len(raw_bytes),
-                            "raw_preview": preview,
-                        },
-                    }
-                ),
-                400,
-            )
-
-        # valida e persiste
-        validate_event(data)
-        evt = STORE.add(data)
-        _shadow_xadd(evt)
-        return jsonify({"ok": True, "id": int(evt.get("id", 0) or 0)}), 200
-
-
-    except ValueError as ve:
-        return jsonify({"ok": False, "error": str(ve)}), 400
-    except Exception as e:
-        return jsonify({"ok": False, "error": f"internal: {e}"}), 500
-
+    # --- fallback legado ---
+    STORE.add(evt)
+    return jsonify({
+        "ok": True,
+        "legacy": True,
+        "event_id": event_id,
+        "trader_key": trader_key
+    }), 200
 
 def _iter_ndjson(objs: Iterable[Dict[str, Any]]):
     for obj in objs:
