@@ -538,10 +538,61 @@ def publish_event():
         "trader_key": trader_key
     }), 200
 
+@app.get("/api/v1/events/consume")
+def consume_events():
+    trader_key = (request.args.get("trader_key") or "").strip()
+    if not trader_key:
+        return jsonify({"ok": False, "error": "missing_trader_key"}), 400
+
+    cursor = (request.args.get("cursor") or "0-0").strip()
+    try:
+        count = int(request.args.get("count") or TFA_CONSUME_COUNT)
+        count = max(1, min(count, 1000))
+    except Exception:
+        count = TFA_CONSUME_COUNT
+
+    # --- Redis Streams (Fase 1) ---
+    if TFA_REDIS_STREAMS:
+        r = _redis_xread_events(trader_key, cursor, count)
+        if not r.get("ok"):
+            return jsonify({
+                "ok": False,
+                "error": "redis_xread_failed",
+                "detail": r
+            }), 500
+
+        return jsonify({
+            "ok": True,
+            "trader_key": trader_key,
+            "stream": r.get("stream"),
+            "cursor": cursor,
+            "next_cursor": r.get("next_cursor"),
+            "events": r.get("events", [])
+        }), 200
+
+    # --- fallback legado (NDJSON) ---
+    try:
+        since_id = int(cursor.split("-")[0]) if cursor else 0
+    except Exception:
+        since_id = 0
+    events = STORE.since(since_id)
+
+    next_cursor = cursor
+    if events:
+        next_cursor = str(events[-1].get("id", since_id))
+
+    return jsonify({
+        "ok": True,
+        "legacy": True,
+        "trader_key": trader_key,
+        "cursor": cursor,
+        "next_cursor": next_cursor,
+        "events": events
+    }), 200
+
 def _iter_ndjson(objs: Iterable[Dict[str, Any]]):
     for obj in objs:
         yield json.dumps(obj, separators=(",", ":")) + "\n"
-
 
 @app.get("/api/v1/events/stream_ndjson")
 @require_token_flexible
