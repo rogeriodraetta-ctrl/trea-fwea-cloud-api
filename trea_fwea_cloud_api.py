@@ -46,6 +46,16 @@ TFA_REDIS_SHADOW = (
 UPSTASH_REDIS_REST_URL = os.getenv("UPSTASH_REDIS_REST_URL", "").strip()
 UPSTASH_REDIS_REST_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN", "").strip()
 
+# ===== Redis Streams (MVP confiável) =====
+TFA_REDIS_STREAMS = (
+    os.getenv("TFA_REDIS_STREAMS", "1").strip().lower() in ("1", "true", "yes", "on")
+)
+
+TFA_STREAM_PREFIX = os.getenv("TFA_STREAM_PREFIX", "tfa:events:").strip()  # + trader_key
+TFA_DEDUPE_PREFIX = os.getenv("TFA_DEDUPE_PREFIX", "tfa:dedupe:").strip()  # + trader_key + event_id
+TFA_DEDUPE_TTL_SEC = int(os.getenv("TFA_DEDUPE_TTL_SEC", "604800"))  # 7 dias
+TFA_CONSUME_COUNT = int(os.getenv("TFA_CONSUME_COUNT", "200"))
+
 logging.info(
     "BOOT: TFA_REDIS_SHADOW=%s UPSTASH_URL=%s TOKEN_SET=%s",
     TFA_REDIS_SHADOW,
@@ -319,6 +329,113 @@ def _upstash_cmd(args: List[str]) -> Dict[str, Any]:
     except Exception as e:
         return {"ok": False, "error": f"upstash_exc:{e}"}
 
+# ===================== Redis Streams (core) =====================
+def _stream_name(trader_key: str) -> str:
+    tk = (trader_key or "").strip()
+    return f"{TFA_STREAM_PREFIX}{tk}"
+
+def _dedupe_key(trader_key: str, event_id: str) -> str:
+    tk = (trader_key or "").strip()
+    eid = (event_id or "").strip()
+    return f"{TFA_DEDUPE_PREFIX}{tk}:{eid}"
+
+def _redis_set_dedupe_if_new(trader_key: str, event_id: str, stream_id: str = "") -> bool:
+    """
+    Retorna True se conseguiu registrar como novo (NX), False se já existia (duplicado).
+    """
+    if not event_id:
+        # se não tiver event_id, não dá pra dedupar; trata como novo
+        return True
+
+    key = _dedupe_key(trader_key, event_id)
+    val = stream_id or "1"
+    # SET key val NX EX <ttl>
+    r = _upstash_cmd(["SET", key, val, "NX", "EX", str(TFA_DEDUPE_TTL_SEC)])
+    # Upstash REST normalmente retorna {"result": "OK"} quando seta, ou {"result": None} se não setou (já existia)
+    return isinstance(r, dict) and (r.get("result") == "OK")
+
+def _redis_xadd_event(evt: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Grava no Redis Stream do trader_key. Retorna dict:
+      {ok:bool, stream:str, redis_id:str, error?:str}
+    """
+    if not UPSTASH_REDIS_REST_URL or not UPSTASH_REDIS_REST_TOKEN:
+        return {"ok": False, "error": "missing_upstash_env"}
+
+    trader_key = (evt.get("trader_key") or "").strip()
+    if not trader_key:
+        trader_key = f"trader_{evt.get('trader_id','')}".strip()
+
+    stream = _stream_name(trader_key)
+    evt_json = json.dumps(evt, ensure_ascii=False, separators=(",", ":"))
+
+    # Campos indexáveis + payload completo em "json"
+    args = [
+        "XADD", stream, "*",
+        "event_id", str(evt.get("event_id", "")),
+        "seq", str(evt.get("seq", 0)),
+        "ts", str(evt.get("ts", 0)),
+        "server_ts", str(int(time.time())),
+        "action", str(evt.get("action", "")),
+        "symbol", str(evt.get("symbol", "")),
+        "position_id", str(evt.get("position_id", 0)),
+        "json", evt_json,
+    ]
+
+    r = _upstash_cmd(args)
+    redis_id = r.get("result") if isinstance(r, dict) else None
+    if not redis_id:
+        return {"ok": False, "stream": stream, "error": f"xadd_failed:{r}"}
+    return {"ok": True, "stream": stream, "redis_id": str(redis_id), "trader_key": trader_key}
+
+def _redis_xread_events(trader_key: str, cursor: str, count: int) -> Dict[str, Any]:
+    """
+    Lê do stream a partir do cursor (Redis Stream ID).
+    cursor:
+      - "$" (não recomendado p/ MVP) -> só novos
+      - "0-0" -> desde o início
+      - "<last_id>" -> a partir do último consumido (retorna > last_id)
+    Retorna:
+      {ok, events:[dict], next_cursor, stream, error?}
+    """
+    if not UPSTASH_REDIS_REST_URL or not UPSTASH_REDIS_REST_TOKEN:
+        return {"ok": False, "error": "missing_upstash_env"}
+
+    tk = (trader_key or "").strip()
+    stream = _stream_name(tk)
+    cur = (cursor or "0-0").strip()
+
+    # XREAD COUNT <n> STREAMS <stream> <cursor>
+    r = _upstash_cmd(["XREAD", "COUNT", str(max(1, count)), "STREAMS", stream, cur])
+    if not isinstance(r, dict) or r.get("result") is None:
+        # sem eventos
+        return {"ok": True, "events": [], "next_cursor": cur, "stream": stream}
+
+    try:
+        # formato típico: [[stream, [[id, [k1,v1,k2,v2...]], [id2, [...]]]]]
+        outer = r["result"]
+        items = outer[0][1] if outer and outer[0] and len(outer[0]) > 1 else []
+        out_events: List[Dict[str, Any]] = []
+        next_cursor = cur
+
+        for it in items:
+            rid = it[0]
+            kv = it[1]  # lista [k,v,k,v...]
+            d = {kv[i]: kv[i+1] for i in range(0, len(kv), 2)}
+            payload = d.get("json", "")
+            if payload:
+                try:
+                    evt = json.loads(payload)
+                    if isinstance(evt, dict):
+                        evt["_redis_id"] = rid
+                        out_events.append(evt)
+                except Exception:
+                    pass
+            next_cursor = rid  # último id lido
+
+        return {"ok": True, "events": out_events, "next_cursor": next_cursor, "stream": stream}
+    except Exception as e:
+        return {"ok": False, "error": f"xread_parse_failed:{e}", "raw": str(r)[:200], "stream": stream}
 
 def _shadow_xadd(evt: Dict[str, Any]) -> None:
     if not TFA_REDIS_SHADOW:
