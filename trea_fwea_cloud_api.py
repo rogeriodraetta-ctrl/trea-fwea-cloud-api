@@ -488,7 +488,12 @@ def health():
 
 @app.post("/api/v1/events/publish")
 def publish_event():
-    evt = request.get_json(force=True, silent=True) or {}
+    try:
+        evt = parse_json_body()
+    except ValueError as ve:
+        return jsonify({"ok": False, "error": str(ve)}), 400
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"internal_parse:{e}"}), 500
 
     # --- validações mínimas ---
     trader_key = (evt.get("trader_key") or "").strip()
@@ -497,7 +502,15 @@ def publish_event():
 
     event_id = (evt.get("event_id") or "").strip()
     if not event_id:
-        return jsonify({"ok": False, "error": "missing_event_id"}), 400
+        # gera event_id determinístico a partir do payload do TREA
+        event_id = (
+            f"{trader_key}|"
+            f"{evt.get('seq',0)}|"
+            f"{evt.get('action','')}|"
+            f"{evt.get('position_id',0)}|"
+            f"{evt.get('ts',0)}"
+        )
+        evt["event_id"] = event_id
 
     evt["server_ts"] = int(time.time())
 
