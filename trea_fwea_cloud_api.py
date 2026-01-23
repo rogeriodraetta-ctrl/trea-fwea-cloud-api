@@ -689,11 +689,8 @@ def publish_event():
     }), 200
 
 @app.get("/api/v1/events/consume")
+@require_token_flexible
 def consume_events():
-    ok_tok, tok, status = require_consume_token()
-    if not ok_tok:
-        return jsonify({"ok": False, "error": ("missing_token" if status == 401 else "invalid_token")}), status
- 
     trader_key = (request.args.get("trader_key") or "").strip()
     if not trader_key:
         return jsonify({"ok": False, "error": "missing_trader_key"}), 400
