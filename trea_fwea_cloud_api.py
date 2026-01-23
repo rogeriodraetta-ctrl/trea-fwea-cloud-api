@@ -191,6 +191,7 @@ _METRICS_LOCK = threading.RLock()
 _METRICS = {
     # OK
     "publish_ok_total": 0,
+    "publish_duplicate_total": 0,
     "consume_ok_total": 0,
     "consume_events_total": 0,
 
@@ -631,15 +632,16 @@ def publish_event():
     if TFA_REDIS_STREAMS:
         is_new = _redis_set_dedupe_if_new(trader_key, event_id)
         if not is_new:
-           with _METRICS_LOCK:
-               _METRICS["publish_ok_total"] += 1
+            with _METRICS_LOCK:
+                _METRICS["publish_ok_total"] += 1
+                _METRICS["publish_duplicate_total"] += 1
 
-           return jsonify({
-               "ok": True,
-               "duplicate": True,
-               "event_id": event_id,
-               "trader_key": trader_key
-           }), 200
+            return jsonify({
+                "ok": True,
+                "duplicate": True,
+                "event_id": event_id,
+                "trader_key": trader_key
+            }), 200
 
         r = _redis_xadd_event(evt)
         if not r.get("ok"):
