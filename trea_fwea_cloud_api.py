@@ -189,9 +189,22 @@ STORE = EventStore(persist_path=PERSIST_PATH)
 # ======================== Metrics =========================
 _METRICS_LOCK = threading.RLock()
 _METRICS = {
+    # OK
     "publish_ok_total": 0,
     "consume_ok_total": 0,
     "consume_events_total": 0,
+
+    # AUTH errors (geral)
+    "auth_401_total": 0,
+    "auth_403_total": 0,
+
+    # AUTH errors por endpoint
+    "auth_401_publish_total": 0,
+    "auth_403_publish_total": 0,
+    "auth_401_consume_total": 0,
+    "auth_403_consume_total": 0,
+    "auth_401_metrics_total": 0,
+    "auth_403_metrics_total": 0,
 }
 
 # ===================== Auth (flexível) ====================
@@ -206,9 +219,31 @@ def require_token_flexible(fn):
         if not token:
             token = request.args.get("token", "").strip()
         if not token:
+            with _METRICS_LOCK:
+                _METRICS["auth_401_total"] += 1
+                p = request.path or ""
+                if p.endswith("/api/v1/events/publish"):
+                    _METRICS["auth_401_publish_total"] += 1
+                elif p.endswith("/api/v1/events/consume"):
+                    _METRICS["auth_401_consume_total"] += 1
+                elif p.endswith("/api/v1/metrics"):
+                    _METRICS["auth_401_metrics_total"] += 1
+
             return jsonify({"error": "Missing or invalid token"}), 401
+
         if token not in VALID_TOKENS:
+            with _METRICS_LOCK:
+                _METRICS["auth_403_total"] += 1
+                p = request.path or ""
+                if p.endswith("/api/v1/events/publish"):
+                    _METRICS["auth_403_publish_total"] += 1
+                elif p.endswith("/api/v1/events/consume"):
+                    _METRICS["auth_403_consume_total"] += 1
+                elif p.endswith("/api/v1/metrics"):
+                    _METRICS["auth_403_metrics_total"] += 1
+
             return jsonify({"error": "Unauthorized"}), 403
+
         return fn(*args, **kwargs)
     return wrapper
 
@@ -219,10 +254,19 @@ def require_consume_token() -> "tuple[bool, str, int]":
     Retorna (ok, token, http_status_em_erro)
     """
     token = (request.args.get("token") or "").strip()
+
     if not token:
+        with _METRICS_LOCK:
+            _METRICS["auth_401_total"] += 1
+            _METRICS["auth_401_consume_total"] += 1
         return (False, "", 401)
+
     if token not in VALID_TOKENS:
+        with _METRICS_LOCK:
+            _METRICS["auth_403_total"] += 1
+            _METRICS["auth_403_consume_total"] += 1
         return (False, token, 403)
+
     return (True, token, 200)
 
 # ======================= Validators =======================
@@ -549,6 +593,7 @@ def metrics():
     return jsonify({"ok": True, "ts": int(time.time()), "metrics": snap}), 200
 
 @app.post("/api/v1/events/publish")
+@require_token_flexible
 def publish_event():
     try:
         evt = parse_json_body()
