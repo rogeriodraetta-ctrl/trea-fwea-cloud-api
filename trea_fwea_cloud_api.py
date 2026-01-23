@@ -586,6 +586,21 @@ def health():
     s["last_seq_by_trader"] = STORE.last_seq_by_trader(limit=50)
     return jsonify({"status": "ok", "ts": int(time.time()), **s})
 
+@app.post("/api/v1/metrics/reset")
+@require_token_flexible
+def metrics_reset():
+    reset_token = (os.getenv("TFA_METRICS_RESET_TOKEN") or "").strip()
+    req_token = (request.args.get("reset_token") or "").strip()
+
+    if not reset_token or req_token != reset_token:
+        return jsonify({"ok": False, "error": "reset_forbidden"}), 403
+
+    with _METRICS_LOCK:
+        for k in _METRICS.keys():
+            _METRICS[k] = 0
+
+    return jsonify({"ok": True, "ts": int(time.time()), "metrics": dict(_METRICS)}), 200
+
 @app.get("/api/v1/metrics")
 @require_token_flexible
 def metrics():
