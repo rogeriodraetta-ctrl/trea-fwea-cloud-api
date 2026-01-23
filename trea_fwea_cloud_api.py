@@ -22,6 +22,7 @@ from __future__ import annotations
 import os, json, time, threading, logging
 import urllib.request
 import urllib.error
+from urllib.parse import parse_qs, unquote_plus
 from typing import Any, Dict, Iterable, List
 from functools import wraps
 
@@ -254,6 +255,18 @@ def parse_json_body() -> Dict[str, Any]:
 
         if isinstance(obj, dict):
             return obj
+
+        # fallback: body como querystring (ex: data=%7B...%7D)
+        try:
+            qs = parse_qs(raw, keep_blank_values=True)
+            for key in ("json", "data", "body"):
+                if key in qs and qs[key]:
+                    v = unquote_plus(qs[key][0]).strip()
+                    obj = json.loads(v)
+                    if isinstance(obj, dict):
+                        return obj
+        except Exception:
+            pass
 
     # B) Segundo: tentativa padrão do Flask
     data = request.get_json(silent=True)
@@ -501,7 +514,13 @@ def publish_event():
     try:
         evt = parse_json_body()
     except ValueError as ve:
-        return jsonify({"ok": False, "error": str(ve)}), 400
+        raw_dbg = request.get_data(cache=True, as_text=True)
+        return jsonify({
+            "ok": False,
+            "error": str(ve),
+            "ct": (request.content_type or ""),
+            "raw_head": (raw_dbg[:200] if raw_dbg else ""),
+        }), 400
     except Exception as e:
         return jsonify({"ok": False, "error": f"internal_parse:{e}"}), 500
 
