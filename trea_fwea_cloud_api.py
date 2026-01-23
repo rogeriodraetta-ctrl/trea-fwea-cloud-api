@@ -204,6 +204,19 @@ def require_token_flexible(fn):
         return fn(*args, **kwargs)
     return wrapper
 
+def require_consume_token() -> "tuple[bool, str, int]":
+    """
+    Token obrigatório no /consume via querystring: ?token=...
+    Valida contra TFA_VALID_TOKENS (mesma lista já usada no projeto).
+    Retorna (ok, token, http_status_em_erro)
+    """
+    token = (request.args.get("token") or "").strip()
+    if not token:
+        return (False, "", 401)
+    if token not in VALID_TOKENS:
+        return (False, token, 403)
+    return (True, token, 200)
+
 # ======================= Validators =======================
 REQUIRED_FIELDS = [
     "ts",
@@ -594,6 +607,10 @@ def publish_event():
 
 @app.get("/api/v1/events/consume")
 def consume_events():
+    ok_tok, tok, status = require_consume_token()
+    if not ok_tok:
+        return jsonify({"ok": False, "error": ("missing_token" if status == 401 else "invalid_token")}), status
+ 
     trader_key = (request.args.get("trader_key") or "").strip()
     if not trader_key:
         return jsonify({"ok": False, "error": "missing_trader_key"}), 400
