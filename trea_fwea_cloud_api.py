@@ -186,6 +186,14 @@ class EventStore:
 PERSIST_PATH = os.getenv("TFA_PERSIST_PATH", "/tmp/trea_fwea_events.jsonl")
 STORE = EventStore(persist_path=PERSIST_PATH)
 
+# ======================== Metrics =========================
+_METRICS_LOCK = threading.RLock()
+_METRICS = {
+    "publish_ok_total": 0,
+    "consume_ok_total": 0,
+    "consume_events_total": 0,
+}
+
 # ===================== Auth (flexível) ====================
 def require_token_flexible(fn):
     """Aceita Authorization: Bearer <token> OU ?token=<token>."""
@@ -533,6 +541,12 @@ def health():
     s["last_seq_by_trader"] = STORE.last_seq_by_trader(limit=50)
     return jsonify({"status": "ok", "ts": int(time.time()), **s})
 
+@app.get("/api/v1/metrics")
+@require_token_flexible
+def metrics():
+    with _METRICS_LOCK:
+        snap = dict(_METRICS)
+    return jsonify({"ok": True, "ts": int(time.time()), "metrics": snap}), 200
 
 @app.post("/api/v1/events/publish")
 def publish_event():
@@ -572,12 +586,15 @@ def publish_event():
     if TFA_REDIS_STREAMS:
         is_new = _redis_set_dedupe_if_new(trader_key, event_id)
         if not is_new:
-            return jsonify({
-                "ok": True,
-                "duplicate": True,
-                "event_id": event_id,
-                "trader_key": trader_key
-            }), 200
+           with _METRICS_LOCK:
+               _METRICS["publish_ok_total"] += 1
+
+           return jsonify({
+               "ok": True,
+               "duplicate": True,
+               "event_id": event_id,
+               "trader_key": trader_key
+           }), 200
 
         r = _redis_xadd_event(evt)
         if not r.get("ok"):
@@ -587,6 +604,9 @@ def publish_event():
                 "detail": r
             }), 500
 
+        with _METRICS_LOCK:
+            _METRICS["publish_ok_total"] += 1
+
         return jsonify({
             "ok": True,
             "event_id": event_id,
@@ -595,6 +615,7 @@ def publish_event():
             "redis_id": r.get("redis_id"),
             "server_ts": evt["server_ts"]
         }), 200
+
 
     # --- fallback legado ---
     STORE.add(evt)
@@ -632,13 +653,19 @@ def consume_events():
                 "detail": r
             }), 500
 
+        events_out = r.get("events", []) or []
+
+        with _METRICS_LOCK:
+            _METRICS["consume_ok_total"] += 1
+            _METRICS["consume_events_total"] += len(events_out)
+
         return jsonify({
             "ok": True,
             "trader_key": trader_key,
             "stream": r.get("stream"),
             "cursor": cursor,
             "next_cursor": r.get("next_cursor"),
-            "events": r.get("events", [])
+            "events": events_out
         }), 200
 
     # --- fallback legado (NDJSON) ---
