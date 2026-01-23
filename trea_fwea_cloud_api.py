@@ -241,11 +241,19 @@ def parse_json_body() -> Dict[str, Any]:
 
     # 1) tentativa padrão do Flask (às vezes funciona)
     data = request.get_json(silent=True)
+    if isinstance(data, str):
+        try:
+            data2 = json.loads(data)
+            if isinstance(data2, dict):
+                return data2
+        except Exception:
+            pass
+
     if isinstance(data, dict):
         return data
 
     # 2) lê o corpo bruto como texto (UTF-8) e tenta json.loads
-    raw = request.get_data(cache=False, as_text=True)
+    raw = request.get_data(cache=True, as_text=True)
     if raw:
         try:
             obj = json.loads(raw)
