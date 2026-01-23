@@ -237,6 +237,8 @@ def parse_json_body() -> Dict[str, Any]:
     - corpo como string JSON "duplamente serializada"
     - fallback para raw bytes e até form-urlencoded com campo 'json'/'data'
     """
+    obj: Any = None
+
     # 1) tentativa padrão do Flask (às vezes funciona)
     data = request.get_json(silent=True)
     if isinstance(data, dict):
@@ -247,12 +249,20 @@ def parse_json_body() -> Dict[str, Any]:
     if raw:
         try:
             obj = json.loads(raw)
+
+            # se veio como string JSON (ex: "\"{...}\"" ou "{...}" como string)
             if isinstance(obj, str):
-                obj2 = json.loads(obj)
-                if isinstance(obj2, dict):
-                    return obj2
+                s = obj.strip()
+                if (s.startswith('"') and s.endswith('"')) or (s.startswith("'") and s.endswith("'")):
+                    s = s[1:-1]
+                try:
+                    obj = json.loads(s)
+                except Exception:
+                    pass
+
             if isinstance(obj, dict):
                 return obj
+
         except Exception:
             pass
 
@@ -268,7 +278,6 @@ def parse_json_body() -> Dict[str, Any]:
         pass
 
     raise ValueError("Body must be a JSON object")
-
 
 def validate_event(evt: Dict[str, Any]) -> None:
     missing = [k for k in REQUIRED_FIELDS if k not in evt]
