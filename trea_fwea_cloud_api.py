@@ -256,6 +256,16 @@ def parse_json_body() -> Dict[str, Any]:
         if isinstance(obj, dict):
             return obj
 
+        # JSON puro vindo como form-urlencoded (MT5 faz isso)
+        sraw = raw.strip()
+        if sraw.startswith("{") or sraw.startswith("["):
+            try:
+                obj = json.loads(sraw)
+                if isinstance(obj, dict):
+                    return obj
+            except Exception:
+                pass
+
         # fallback: body como querystring (ex: data=%7B...%7D)
         try:
             qs = parse_qs(raw, keep_blank_values=True)
