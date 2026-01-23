@@ -236,6 +236,8 @@ def parse_json_body() -> Dict[str, Any]:
 
     # A) Primeiro: lê corpo bruto SEM depender do Content-Type
     raw = request.get_data(cache=True, as_text=True)
+    raw = (raw or "").replace("\x00", "")
+
     if raw:
         # tenta JSON direto
         try:
