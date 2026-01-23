@@ -231,15 +231,31 @@ ACTIONS = {
 
 
 def parse_json_body() -> Dict[str, Any]:
-    """
-    Parser robusto para aceitar variações do MT5:
-    - JSON com Content-Type incorreto
-    - corpo como string JSON "duplamente serializada"
-    - fallback para raw bytes e até form-urlencoded com campo 'json'/'data'
-    """
     obj: Any = None
 
-    # 1) tentativa padrão do Flask (às vezes funciona)
+    # A) Primeiro: lê corpo bruto SEM depender do Content-Type
+    raw = request.get_data(cache=True, as_text=True)
+    if raw:
+        # tenta JSON direto
+        try:
+            obj = json.loads(raw)
+        except Exception:
+            obj = None
+
+        # se veio como string JSON (dupla serialização), tenta de novo
+        if isinstance(obj, str):
+            s = obj.strip()
+            if (s.startswith('"') and s.endswith('"')) or (s.startswith("'") and s.endswith("'")):
+                s = s[1:-1]
+            try:
+                obj = json.loads(s)
+            except Exception:
+                pass
+
+        if isinstance(obj, dict):
+            return obj
+
+    # B) Segundo: tentativa padrão do Flask
     data = request.get_json(silent=True)
     if isinstance(data, str):
         try:
@@ -248,33 +264,10 @@ def parse_json_body() -> Dict[str, Any]:
                 return data2
         except Exception:
             pass
-
     if isinstance(data, dict):
         return data
 
-    # 2) lê o corpo bruto como texto (UTF-8) e tenta json.loads
-    raw = request.get_data(cache=True, as_text=True)
-    if raw:
-        try:
-            obj = json.loads(raw)
-
-            # se veio como string JSON (ex: "\"{...}\"" ou "{...}" como string)
-            if isinstance(obj, str):
-                s = obj.strip()
-                if (s.startswith('"') and s.endswith('"')) or (s.startswith("'") and s.endswith("'")):
-                    s = s[1:-1]
-                try:
-                    obj = json.loads(s)
-                except Exception:
-                    pass
-
-            if isinstance(obj, dict):
-                return obj
-
-        except Exception:
-            pass
-
-    # 3) fallback: tenta extrair de form-urlencoded (ex: json=<...> ou data=<...>)
+    # C) Terceiro: fallback form
     try:
         if request.form:
             for key in ("json", "data", "body"):
