@@ -8,9 +8,9 @@ Endpoints (v1):
   • GET  /api/v1/health                - heartbeat (público)
 
 Segurança:
-  • Authorization: Bearer <token>
-  • Também aceita ?token=<...> na query string (fallback)
-  • Tokens via env (TFA_VALID_TOKENS) separados por vírgula; fallback DEV.
+  • Authorization: Bearer <token> (OBRIGATÓRIO em PROD)
+  • ?token=<...> aceito APENAS em DEV/TESTE (controlado por TFA_ALLOW_QUERY_TOKEN)
+  • Tokens via env (TFA_VALID_TOKENS) separados por vírgula; fallback automático APENAS se a env não estiver definida (DEV).
 
 Notas:
   • Buffer em memória com lock (thread-safe) para esta fase.
@@ -56,6 +56,9 @@ TFA_STREAM_PREFIX = os.getenv("TFA_STREAM_PREFIX", "tfa:events:").strip()  # + t
 TFA_DEDUPE_PREFIX = os.getenv("TFA_DEDUPE_PREFIX", "tfa:dedupe:").strip()  # + trader_key + event_id
 TFA_DEDUPE_TTL_SEC = int(os.getenv("TFA_DEDUPE_TTL_SEC", "604800"))  # 7 dias
 TFA_CONSUME_COUNT = int(os.getenv("TFA_CONSUME_COUNT", "200"))
+
+# DEV ONLY: aceitar token na querystring (?token=...) só em dev/teste
+TFA_ALLOW_QUERY_TOKEN = os.getenv("TFA_ALLOW_QUERY_TOKEN", "0").strip().lower() in ("1", "true", "yes", "on")
 
 logging.info(
     "BOOT: TFA_REDIS_SHADOW=%s UPSTASH_URL=%s TOKEN_SET=%s",
@@ -218,7 +221,12 @@ def require_token_flexible(fn):
         if auth.startswith("Bearer "):
             token = auth.split(" ", 1)[1].strip()
         if not token:
-            token = request.args.get("token", "").strip()
+            # DEV ONLY: query token só se habilitado
+            if TFA_ALLOW_QUERY_TOKEN:
+                token = request.args.get("token", "").strip()
+            else:
+                token = ""
+
         if not token:
             with _METRICS_LOCK:
                 _METRICS["auth_401_total"] += 1
@@ -229,8 +237,10 @@ def require_token_flexible(fn):
                     _METRICS["auth_401_consume_total"] += 1
                 elif p.endswith("/api/v1/metrics"):
                     _METRICS["auth_401_metrics_total"] += 1
+                elif p.endswith("/api/v1/metrics/reset"):
+                    _METRICS["auth_401_metrics_total"] += 1   # (no bloco 401)
 
-            return jsonify({"error": "Missing or invalid token"}), 401
+            return jsonify({"ok": False, "error": "missing_token"}), 401
 
         if token not in VALID_TOKENS:
             with _METRICS_LOCK:
@@ -242,33 +252,13 @@ def require_token_flexible(fn):
                     _METRICS["auth_403_consume_total"] += 1
                 elif p.endswith("/api/v1/metrics"):
                     _METRICS["auth_403_metrics_total"] += 1
+                elif p.endswith("/api/v1/metrics/reset"):
+                    _METRICS["auth_403_metrics_total"] += 1
 
-            return jsonify({"error": "Unauthorized"}), 403
+            return jsonify({"ok": False, "error": "unauthorized"}), 403
 
         return fn(*args, **kwargs)
     return wrapper
-
-def require_consume_token() -> "tuple[bool, str, int]":
-    """
-    Token obrigatório no /consume via querystring: ?token=...
-    Valida contra TFA_VALID_TOKENS (mesma lista já usada no projeto).
-    Retorna (ok, token, http_status_em_erro)
-    """
-    token = (request.args.get("token") or "").strip()
-
-    if not token:
-        with _METRICS_LOCK:
-            _METRICS["auth_401_total"] += 1
-            _METRICS["auth_401_consume_total"] += 1
-        return (False, "", 401)
-
-    if token not in VALID_TOKENS:
-        with _METRICS_LOCK:
-            _METRICS["auth_403_total"] += 1
-            _METRICS["auth_403_consume_total"] += 1
-        return (False, token, 403)
-
-    return (True, token, 200)
 
 # ======================= Validators =======================
 REQUIRED_FIELDS = [
