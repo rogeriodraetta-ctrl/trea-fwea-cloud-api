@@ -213,7 +213,7 @@ _METRICS = {
 
 # ===================== Auth (flexível) ====================
 def require_token_flexible(fn):
-    """Aceita Authorization: Bearer <token> OU ?token=<token>."""
+    """Aceita Authorization: Bearer <token> OU X-Api-Token; em /publish aceita token no body; ?token= apenas DEV."""
     @wraps(fn)
     def wrapper(*args, **kwargs):
         auth = request.headers.get("Authorization", "")
@@ -226,6 +226,14 @@ def require_token_flexible(fn):
         # 2) Fallback MT5-friendly: X-Api-Token
         if not token:
             token = (request.headers.get("X-Api-Token", "") or "").strip()
+
+        # 2.5) Fallback FINAL (MT5-safe): token no JSON BODY (apenas no /publish)
+        if not token and request.method == "POST" and (request.path or "").endswith("/api/v1/events/publish"):
+            try:
+                body_evt = parse_json_body()
+                token = (body_evt.get("token", "") or "").strip()
+            except Exception:
+                token = ""
 
         # 3) DEV ONLY: query token (?token=)
         if not token:
