@@ -227,13 +227,15 @@ def require_token_flexible(fn):
         if not token:
             token = (request.headers.get("X-Api-Token", "") or "").strip()
 
-        # 2.5) Fallback FINAL (MT5-safe): token no JSON BODY (apenas no /publish)
-        if not token and request.method == "POST" and (request.path or "").endswith("/api/v1/events/publish"):
-            try:
-                body_evt = parse_json_body()
-                token = (body_evt.get("token", "") or "").strip()
-            except Exception:
-                token = ""
+        # 2.5) Fallback FINAL (MT5-safe): token no JSON BODY (apenas no /publish e /consume)
+        if not token and request.method == "POST":
+            p = (request.path or "")
+            if p.endswith("/api/v1/events/publish") or p.endswith("/api/v1/events/consume"):
+                try:
+                    body_evt = parse_json_body()
+                    token = (body_evt.get("token", "") or "").strip()
+                except Exception:
+                    token = ""
 
         # 3) DEV ONLY: query token (?token=)
         if not token:
@@ -694,19 +696,33 @@ def publish_event():
         "trader_key": trader_key
     }), 200
 
-@app.get("/api/v1/events/consume")
+@app.route("/api/v1/events/consume", methods=["GET", "POST"])
 @require_token_flexible
 def consume_events():
-    trader_key = (request.args.get("trader_key") or "").strip()
+    # GET (legado) ou POST (novo)
+    if request.method == "POST":
+        try:
+            b = parse_json_body()
+        except Exception:
+            b = {}
+        trader_key = str(b.get("trader_key", "") or "").strip()
+        cursor = str(b.get("cursor", "0-0") or "0-0").strip()
+        try:
+            count = int(b.get("count", TFA_CONSUME_COUNT))
+            count = max(1, min(count, 1000))
+        except Exception:
+            count = TFA_CONSUME_COUNT
+    else:
+        trader_key = (request.args.get("trader_key") or "").strip()
+        cursor = (request.args.get("cursor") or "0-0").strip()
+        try:
+            count = int(request.args.get("count") or TFA_CONSUME_COUNT)
+            count = max(1, min(count, 1000))
+        except Exception:
+            count = TFA_CONSUME_COUNT
+
     if not trader_key:
         return jsonify({"ok": False, "error": "missing_trader_key"}), 400
-
-    cursor = (request.args.get("cursor") or "0-0").strip()
-    try:
-        count = int(request.args.get("count") or TFA_CONSUME_COUNT)
-        count = max(1, min(count, 1000))
-    except Exception:
-        count = TFA_CONSUME_COUNT
 
     # --- Redis Streams (Fase 1) ---
     if TFA_REDIS_STREAMS:
