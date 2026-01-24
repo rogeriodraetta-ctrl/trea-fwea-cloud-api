@@ -218,14 +218,22 @@ def require_token_flexible(fn):
     def wrapper(*args, **kwargs):
         auth = request.headers.get("Authorization", "")
         token = ""
+
+        # 1) Padrão: Authorization: Bearer <token>
         if auth.startswith("Bearer "):
             token = auth.split(" ", 1)[1].strip()
+
+        # 2) Fallback MT5-friendly: X-Api-Token
         if not token:
-            # DEV ONLY: query token só se habilitado
+            token = (request.headers.get("X-Api-Token", "") or "").strip()
+
+        # 3) DEV ONLY: query token (?token=)
+        if not token:
             if TFA_ALLOW_QUERY_TOKEN:
                 token = request.args.get("token", "").strip()
             else:
                 token = ""
+
 
         if not token:
             with _METRICS_LOCK:
