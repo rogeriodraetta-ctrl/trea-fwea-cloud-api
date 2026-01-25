@@ -769,6 +769,85 @@ def consume_events():
         "events": events
     }), 200
 
+@app.get("/api/v1/events/consume_wait")
+@require_token_flexible
+def consume_events_wait():
+    """
+    Long-poll simples:
+      - espera até wait segundos por eventos novos
+      - retorna imediatamente se houver evento
+      - se não houver, retorna events=[] com next_cursor igual ao cursor recebido
+    """
+    trader_key = (request.args.get("trader_key") or "").strip()
+    cursor = (request.args.get("cursor") or "0-0").strip()
+
+    try:
+        count = int(request.args.get("count") or TFA_CONSUME_COUNT)
+        count = max(1, min(count, 1000))
+    except Exception:
+        count = TFA_CONSUME_COUNT
+
+    try:
+        wait_s = int(request.args.get("wait") or "10")
+        wait_s = max(1, min(wait_s, 25))  # seguro p/ Render
+    except Exception:
+        wait_s = 10
+
+    if not trader_key:
+        return jsonify({"ok": False, "error": "missing_trader_key"}), 400
+
+    # Se Redis Streams estiver OFF, volta pro consume normal (sem long-poll)
+    if not TFA_REDIS_STREAMS:
+        return jsonify({
+            "ok": True,
+            "legacy": True,
+            "trader_key": trader_key,
+            "cursor": cursor,
+            "next_cursor": cursor,
+            "events": []
+        }), 200
+
+    deadline = time.time() + float(wait_s)
+    sleep_ms = 0.25  # 250ms
+
+    while True:
+        r = _redis_xread_events(trader_key, cursor, count)
+        if not r.get("ok"):
+            return jsonify({"ok": False, "error": "redis_xread_failed", "detail": r}), 500
+
+        events_out = r.get("events", []) or []
+        if events_out:
+            with _METRICS_LOCK:
+                _METRICS["consume_ok_total"] += 1
+                _METRICS["consume_events_total"] += len(events_out)
+
+            return jsonify({
+                "ok": True,
+                "trader_key": trader_key,
+                "stream": r.get("stream"),
+                "cursor": cursor,
+                "next_cursor": r.get("next_cursor"),
+                "events": events_out,
+                "waited_s": round(float(wait_s) - max(0.0, deadline - time.time()), 3)
+            }), 200
+
+        # sem eventos ainda
+        if time.time() >= deadline:
+            with _METRICS_LOCK:
+                _METRICS["consume_ok_total"] += 1
+
+            return jsonify({
+                "ok": True,
+                "trader_key": trader_key,
+                "stream": r.get("stream"),
+                "cursor": cursor,
+                "next_cursor": cursor,
+                "events": [],
+                "waited_s": float(wait_s)
+            }), 200
+
+        time.sleep(sleep_ms)
+
 def _iter_ndjson(objs: Iterable[Dict[str, Any]]):
     for obj in objs:
         yield json.dumps(obj, separators=(",", ":")) + "\n"
