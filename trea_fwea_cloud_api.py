@@ -230,7 +230,7 @@ def require_token_flexible(fn):
         # 2.5) Fallback FINAL (MT5-safe): token no JSON BODY (apenas no /publish e /consume)
         if not token and request.method == "POST":
             p = (request.path or "")
-            if p.endswith("/api/v1/events/publish") or p.endswith("/api/v1/events/consume"):
+            if p.endswith("/api/v1/events/publish") or p.endswith("/api/v1/events/consume") or p.endswith("/api/v1/events/consume_wait"):
                 try:
                     body_evt = parse_json_body()
                     token = (body_evt.get("token", "") or "").strip()
