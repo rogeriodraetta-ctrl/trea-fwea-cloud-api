@@ -769,7 +769,7 @@ def consume_events():
         "events": events
     }), 200
 
-@app.get("/api/v1/events/consume_wait")
+@app.route("/api/v1/events/consume_wait", methods=["GET", "POST"])
 @require_token_flexible
 def consume_events_wait():
     """
@@ -778,17 +778,19 @@ def consume_events_wait():
       - retorna imediatamente se houver evento
       - se não houver, retorna events=[] com next_cursor igual ao cursor recebido
     """
-    trader_key = (request.args.get("trader_key") or "").strip()
-    cursor = (request.args.get("cursor") or "0-0").strip()
+    data = request.get_json(silent=True) or {}
+
+    trader_key = (request.args.get("trader_key") or data.get("trader_key") or "").strip()
+    cursor     = (request.args.get("cursor")     or data.get("cursor")     or "0-0").strip()
 
     try:
-        count = int(request.args.get("count") or TFA_CONSUME_COUNT)
+        count = int(request.args.get("count") or data.get("count") or TFA_CONSUME_COUNT)
         count = max(1, min(count, 1000))
     except Exception:
         count = TFA_CONSUME_COUNT
 
     try:
-        wait_s = int(request.args.get("wait") or "10")
+        wait_s = int(request.args.get("wait") or data.get("wait") or 10)
         wait_s = max(1, min(wait_s, 25))  # seguro p/ Render
     except Exception:
         wait_s = 10
