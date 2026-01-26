@@ -796,7 +796,14 @@ def consume_events_wait():
         wait_s = 10
 
     if not trader_key:
-        return jsonify({"ok": False, "error": "missing_trader_key"}), 400
+        return jsonify({
+            "ok": True,
+            "trader_key": "",
+            "cursor": cursor,
+            "next_cursor": cursor,
+            "events": [],
+            "waited_s": 0
+        }), 200
 
     # Se Redis Streams estiver OFF, volta pro consume normal (sem long-poll)
     if not TFA_REDIS_STREAMS:
