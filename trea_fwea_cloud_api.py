@@ -778,9 +778,12 @@ def consume_events_wait():
       - retorna imediatamente se houver evento
       - se não houver, retorna events=[] com next_cursor igual ao cursor recebido
     """
-    data = request.get_json(silent=True) or {}
+    try:
+       data = parse_json_body()
+    except Exception:
+       data = {}
 
-    trader_key = (request.args.get("trader_key") or data.get("trader_key") or "").strip()
+    trader_key = (request.args.get("trader_key") or data.get("trader_key") or data.get("feed_id") or "").strip()
     cursor     = (request.args.get("cursor")     or data.get("cursor")     or "0-0").strip()
 
     try:
@@ -796,14 +799,7 @@ def consume_events_wait():
         wait_s = 10
 
     if not trader_key:
-        return jsonify({
-            "ok": True,
-            "trader_key": "",
-            "cursor": cursor,
-            "next_cursor": cursor,
-            "events": [],
-            "waited_s": 0
-        }), 200
+       return jsonify({"ok": False, "error": "missing_trader_key"}), 400
 
     # Se Redis Streams estiver OFF, volta pro consume normal (sem long-poll)
     if not TFA_REDIS_STREAMS:
