@@ -786,6 +786,33 @@ def consume_events_wait():
     trader_key = (request.args.get("trader_key") or data.get("trader_key") or data.get("feed_id") or "").strip()
     cursor     = (request.args.get("cursor")     or data.get("cursor")     or "0-0").strip()
 
+    # ---------------------------------------------------------
+    # cursor=latest  -> inicia do "tail" do stream (anti-backlog)
+    # ---------------------------------------------------------
+    if not trader_key:
+       return jsonify({"ok": False, "error": "missing_trader_key"}), 400
+
+    if isinstance(cursor, str) and cursor.strip().lower() in ("latest", "$"):
+        stream = _stream_name(trader_key)
+        last_id = "0-0"
+        try:
+            # XREVRANGE <stream> + - COUNT 1  -> pega o último ID
+            rr = _upstash_cmd(["XREVRANGE", stream, "+", "-", "COUNT", "1"])
+            if isinstance(rr, dict) and rr.get("result"):
+                last_id = str(rr["result"][0][0])
+        except Exception:
+            last_id = "0-0"
+
+        return jsonify({
+            "ok": True,
+            "trader_key": trader_key,
+            "stream": stream,
+            "cursor": cursor,
+            "next_cursor": last_id,
+            "events": [],
+            "waited_s": 0.0
+        }), 200
+
     try:
         count = int(request.args.get("count") or data.get("count") or TFA_CONSUME_COUNT)
         count = max(1, min(count, 1000))
