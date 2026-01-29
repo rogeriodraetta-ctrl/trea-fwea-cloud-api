@@ -56,6 +56,9 @@ TFA_STREAM_PREFIX = os.getenv("TFA_STREAM_PREFIX", "tfa:events:").strip()  # + t
 TFA_DEDUPE_PREFIX = os.getenv("TFA_DEDUPE_PREFIX", "tfa:dedupe:").strip()  # + trader_key + event_id
 TFA_DEDUPE_TTL_SEC = int(os.getenv("TFA_DEDUPE_TTL_SEC", "604800"))  # 7 dias
 TFA_CONSUME_COUNT = int(os.getenv("TFA_CONSUME_COUNT", "200"))
+TFA_CONSUME_WAIT_DEFAULT = int(os.getenv("TFA_CONSUME_WAIT_DEFAULT", "15"))
+TFA_CONSUME_WAIT_MAX     = int(os.getenv("TFA_CONSUME_WAIT_MAX", "25"))
+TFA_LONGPOLL_SLEEP_MS    = float(os.getenv("TFA_LONGPOLL_SLEEP_MS", "0.10"))
 
 # DEV ONLY: aceitar token na querystring (?token=...) só em dev/teste
 TFA_ALLOW_QUERY_TOKEN = os.getenv("TFA_ALLOW_QUERY_TOKEN", "0").strip().lower() in ("1", "true", "yes", "on")
@@ -820,15 +823,12 @@ def consume_events_wait():
         count = TFA_CONSUME_COUNT
 
     try:
-        wait_s = int(request.args.get("wait") or data.get("wait") or 10)
-        wait_s = max(1, min(wait_s, 25))  # seguro p/ Render
+        wait_s = int(request.args.get("wait") or data.get("wait") or TFA_CONSUME_WAIT_DEFAULT)
+        wait_s = max(1, min(wait_s, TFA_CONSUME_WAIT_MAX))
     except Exception:
-        wait_s = 10
+        wait_s = TFA_CONSUME_WAIT_DEFAULT
 
-    if not trader_key:
-       return jsonify({"ok": False, "error": "missing_trader_key"}), 400
-
-    # Se Redis Streams estiver OFF, volta pro consume normal (sem long-poll)
+      # Se Redis Streams estiver OFF, volta pro consume normal (sem long-poll)
     if not TFA_REDIS_STREAMS:
         return jsonify({
             "ok": True,
@@ -840,7 +840,7 @@ def consume_events_wait():
         }), 200
 
     deadline = time.time() + float(wait_s)
-    sleep_ms = 0.25  # 250ms
+    sleep_ms = max(0.05, min(TFA_LONGPOLL_SLEEP_MS, 0.50))
 
     while True:
         r = _redis_xread_events(trader_key, cursor, count)
