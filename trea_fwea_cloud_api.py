@@ -782,9 +782,9 @@ def consume_events_wait():
       - se não houver, retorna events=[] com next_cursor igual ao cursor recebido
     """
     try:
-       data = parse_json_body()
+        data = parse_json_body()
     except Exception:
-       data = {}
+        data = {}
 
     trader_key = (request.args.get("trader_key") or data.get("trader_key") or data.get("feed_id") or "").strip()
     cursor     = (request.args.get("cursor")     or data.get("cursor")     or "0-0").strip()
@@ -793,7 +793,7 @@ def consume_events_wait():
     # cursor=latest  -> inicia do "tail" do stream (anti-backlog)
     # ---------------------------------------------------------
     if not trader_key:
-       return jsonify({"ok": False, "error": "missing_trader_key"}), 400
+        return jsonify({"ok": False, "error": "missing_trader_key"}), 400
 
     if isinstance(cursor, str) and cursor.strip().lower() in ("latest", "$"):
         stream = _stream_name(trader_key)
@@ -822,22 +822,21 @@ def consume_events_wait():
     except Exception:
         count = TFA_CONSUME_COUNT
 
+    # wait pode ser 0 (não-bloqueante). Não usar "or" porque 0 vira default.
     try:
-        wait_s = int(request.args.get("wait") or data.get("wait") or TFA_CONSUME_WAIT_DEFAULT)
-        wait_s = max(1, min(wait_s, TFA_CONSUME_WAIT_MAX))
-    except Exception:
-        wait_s = TFA_CONSUME_WAIT_DEFAULT
+        raw_wait = request.args.get("wait", None)
+        if raw_wait is None:
+            raw_wait = data.get("wait", None)
 
-      # Se Redis Streams estiver OFF, volta pro consume normal (sem long-poll)
-    if not TFA_REDIS_STREAMS:
-        return jsonify({
-            "ok": True,
-            "legacy": True,
-            "trader_key": trader_key,
-            "cursor": cursor,
-            "next_cursor": cursor,
-            "events": []
-        }), 200
+        if raw_wait is None or str(raw_wait).strip() == "":
+            wait_s = int(TFA_CONSUME_WAIT_DEFAULT)
+        else:
+            wait_s = int(raw_wait)
+
+        # permite 0..MAX
+        wait_s = max(0, min(wait_s, int(TFA_CONSUME_WAIT_MAX)))
+    except Exception:
+        wait_s = int(TFA_CONSUME_WAIT_DEFAULT)
 
     deadline = time.time() + float(wait_s)
     sleep_ms = max(0.05, min(TFA_LONGPOLL_SLEEP_MS, 0.50))
