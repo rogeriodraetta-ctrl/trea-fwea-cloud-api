@@ -593,8 +593,14 @@ def _shadow_xadd(evt: Dict[str, Any]) -> None:
 @app.get("/api/v1/health")
 def health():
     s = STORE.stats()
-    # last_seq_by_trader ajuda diagnóstico / recovery
-    s["last_seq_by_trader"] = STORE.last_seq_by_trader(limit=50)
+
+    s["redis_streams_enabled"] = bool(TFA_REDIS_STREAMS)
+    s["upstash_configured"] = bool(UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN)
+    s["allow_query_token"] = bool(TFA_ALLOW_QUERY_TOKEN)
+    s["consume_wait_default"] = int(TFA_CONSUME_WAIT_DEFAULT)
+    s["consume_wait_max"] = int(TFA_CONSUME_WAIT_MAX)
+    s["consume_count_default"] = int(TFA_CONSUME_COUNT)
+
     return jsonify({"status": "ok", "ts": int(time.time()), **s})
 
 @app.post("/api/v1/metrics/reset")
