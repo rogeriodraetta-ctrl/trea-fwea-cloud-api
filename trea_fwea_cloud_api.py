@@ -844,6 +844,28 @@ def consume_events_wait():
     except Exception:
         wait_s = int(TFA_CONSUME_WAIT_DEFAULT)
 
+    # FAST PATH: wait=0 -> 1 leitura e retorna imediatamente (sem loop/sleep)
+    if wait_s <= 0:
+        r = _redis_xread_events(trader_key, cursor, count)
+        if not r.get("ok"):
+            return jsonify({"ok": False, "error": "redis_xread_failed", "detail": r}), 500
+
+        events_out = r.get("events", []) or []
+
+        with _METRICS_LOCK:
+            _METRICS["consume_ok_total"] += 1
+            _METRICS["consume_events_total"] += len(events_out)
+
+        return jsonify({
+            "ok": True,
+            "trader_key": trader_key,
+            "stream": r.get("stream"),
+            "cursor": cursor,
+            "next_cursor": r.get("next_cursor"),
+            "events": events_out,
+            "waited_s": 0.0
+        }), 200
+
     deadline = time.time() + float(wait_s)
     sleep_ms = max(0.05, min(TFA_LONGPOLL_SLEEP_MS, 0.50))
 
