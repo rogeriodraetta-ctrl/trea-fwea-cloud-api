@@ -22,6 +22,7 @@ from __future__ import annotations
 import os, json, time, threading, logging
 import urllib.request
 import urllib.error
+import requests
 from urllib.parse import parse_qs, unquote_plus
 from typing import Any, Dict, Iterable, List
 from functools import wraps
@@ -46,6 +47,17 @@ TFA_REDIS_SHADOW = (
 
 UPSTASH_REDIS_REST_URL = os.getenv("UPSTASH_REDIS_REST_URL", "").strip()
 UPSTASH_REDIS_REST_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN", "").strip()
+
+# ===== Upstash HTTP client (Session / keep-alive) =====
+UPSTASH_CONNECT_TIMEOUT = float(os.getenv("TFA_UPSTASH_CONNECT_TIMEOUT", "2.0"))
+UPSTASH_READ_TIMEOUT    = float(os.getenv("TFA_UPSTASH_READ_TIMEOUT", "5.0"))
+TFA_LOG_UPSTASH_ERRORS  = os.getenv("TFA_LOG_UPSTASH_ERRORS", "1").strip().lower() in ("1","true","yes","on")
+
+_UPSTASH_SESSION = requests.Session()
+_UPSTASH_SESSION.headers.update({
+    "Authorization": f"Bearer {UPSTASH_REDIS_REST_TOKEN}",
+    "Content-Type": "application/json",
+})
 
 # ===== Redis Streams (MVP confiável) =====
 TFA_REDIS_STREAMS = (
@@ -416,30 +428,22 @@ def _upstash_cmd(args: List[str]) -> Dict[str, Any]:
     if not UPSTASH_REDIS_REST_URL or not UPSTASH_REDIS_REST_TOKEN:
         return {"ok": False, "error": "missing_upstash_env"}
 
-    payload = json.dumps(args).encode("utf-8")
-    req = urllib.request.Request(
-        UPSTASH_REDIS_REST_URL,
-        data=payload,
-        method="POST",
-        headers={
-            "Authorization": f"Bearer {UPSTASH_REDIS_REST_TOKEN}",
-            "Content-Type": "application/json",
-        },
-    )
-
     try:
-        with urllib.request.urlopen(req, timeout=3) as resp:
-            raw = resp.read().decode("utf-8", errors="ignore")
-            return json.loads(raw)
-    except urllib.error.HTTPError as e:
-        body = ""
-        try:
-            body = e.read().decode("utf-8", errors="ignore")
-        except Exception:
-            pass
-        return {"ok": False, "error": f"http_{e.code}", "body": body[:200]}
+        resp = _UPSTASH_SESSION.post(
+            UPSTASH_REDIS_REST_URL,
+            data=json.dumps(args).encode("utf-8"),
+            timeout=(UPSTASH_CONNECT_TIMEOUT, UPSTASH_READ_TIMEOUT),
+        )
+        raw = resp.text or ""
+        if resp.status_code >= 400:
+            if TFA_LOG_UPSTASH_ERRORS:
+                return {"ok": False, "error": f"http_{resp.status_code}", "body": raw[:200]}
+            return {"ok": False, "error": f"http_{resp.status_code}"}
+        return json.loads(raw) if raw else {"result": None}
     except Exception as e:
-        return {"ok": False, "error": f"upstash_exc:{e}"}
+        if TFA_LOG_UPSTASH_ERRORS:
+            return {"ok": False, "error": f"upstash_exc:{e}"}
+        return {"ok": False, "error": "upstash_exc"}
 
 # ===================== Redis Streams (core) =====================
 def _stream_name(trader_key: str) -> str:
@@ -949,4 +953,5 @@ def stream_ndjson():
 # ======================== Main ============================
 if __name__ == "__main__":
     app.run(host=HOST, port=PORT, threaded=True)
+
 
