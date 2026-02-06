@@ -71,6 +71,8 @@ TFA_CONSUME_COUNT = int(os.getenv("TFA_CONSUME_COUNT", "20"))
 TFA_CONSUME_WAIT_DEFAULT = int(os.getenv("TFA_CONSUME_WAIT_DEFAULT", "15"))
 TFA_CONSUME_WAIT_MAX     = int(os.getenv("TFA_CONSUME_WAIT_MAX", "25"))
 TFA_LONGPOLL_SLEEP_MS    = float(os.getenv("TFA_LONGPOLL_SLEEP_MS", "0.10"))
+TFA_CONSUME_WAIT_DEFAULT_MS = int(os.getenv("TFA_CONSUME_WAIT_DEFAULT_MS", "800"))   # Premium v1
+TFA_CONSUME_WAIT_MAX_MS     = int(os.getenv("TFA_CONSUME_WAIT_MAX_MS", "2000"))
 
 # DEV ONLY: aceitar token na querystring (?token=...) só em dev/teste
 TFA_ALLOW_QUERY_TOKEN = os.getenv("TFA_ALLOW_QUERY_TOKEN", "0").strip().lower() in ("1", "true", "yes", "on")
@@ -553,6 +555,53 @@ def _redis_xread_events(trader_key: str, cursor: str, count: int) -> Dict[str, A
     except Exception as e:
         return {"ok": False, "error": f"xread_parse_failed:{e}", "raw": str(r)[:200], "stream": stream}
 
+def _redis_xread_events_block(trader_key: str, cursor: str, count: int, block_ms: int) -> Dict[str, Any]:
+    """
+    XREAD com BLOCK (long-poll real no Redis Streams).
+    block_ms: 1..TFA_CONSUME_WAIT_MAX_MS
+    """
+    if not UPSTASH_REDIS_REST_URL or not UPSTASH_REDIS_REST_TOKEN:
+        return {"ok": False, "error": "missing_upstash_env"}
+
+    tk = (trader_key or "").strip()
+    stream = _stream_name(tk)
+    cur = (cursor or "0-0").strip()
+
+    ms = int(block_ms)
+    ms = max(1, min(ms, int(TFA_CONSUME_WAIT_MAX_MS)))
+
+    # XREAD BLOCK <ms> COUNT <n> STREAMS <stream> <cursor>
+    r = _upstash_cmd(["XREAD", "BLOCK", str(ms), "COUNT", str(max(1, count)), "STREAMS", stream, cur])
+
+    if not isinstance(r, dict) or r.get("result") is None:
+        # timeout sem eventos
+        return {"ok": True, "events": [], "next_cursor": cur, "stream": stream, "blocked_ms": ms}
+
+    try:
+        outer = r["result"]
+        items = outer[0][1] if outer and outer[0] and len(outer[0]) > 1 else []
+        out_events: List[Dict[str, Any]] = []
+        next_cursor = cur
+
+        for it in items:
+            rid = it[0]
+            kv = it[1]
+            d = {kv[i]: kv[i+1] for i in range(0, len(kv), 2)}
+            payload = d.get("json", "")
+            if payload:
+                try:
+                    evt = json.loads(payload)
+                    if isinstance(evt, dict):
+                        evt["_redis_id"] = rid
+                        out_events.append(evt)
+                except Exception:
+                    pass
+            next_cursor = rid
+
+        return {"ok": True, "events": out_events, "next_cursor": next_cursor, "stream": stream, "blocked_ms": ms}
+    except Exception as e:
+        return {"ok": False, "error": f"xread_block_parse_failed:{e}", "raw": str(r)[:200], "stream": stream}
+
 def _shadow_xadd(evt: Dict[str, Any]) -> None:
     if not TFA_REDIS_SHADOW:
         return
@@ -832,24 +881,30 @@ def consume_events_wait():
     except Exception:
         count = TFA_CONSUME_COUNT
 
-    # wait pode ser 0 (não-bloqueante). Não usar "or" porque 0 vira default.
+    # Premium: preferir wait_ms (milissegundos). Fallback: wait (segundos).
     try:
-        raw_wait = request.args.get("wait", None)
-        if raw_wait is None:
-            raw_wait = data.get("wait", None)
+        raw_wait_ms = request.args.get("wait_ms", None)
+        if raw_wait_ms is None:
+            raw_wait_ms = data.get("wait_ms", None)
 
-        if raw_wait is None or str(raw_wait).strip() == "":
-            wait_s = int(TFA_CONSUME_WAIT_DEFAULT)
+        if raw_wait_ms is not None and str(raw_wait_ms).strip() != "":
+            wait_ms = int(float(str(raw_wait_ms).strip()))
         else:
-            wait_s = int(raw_wait)
+            raw_wait_s = request.args.get("wait", None)
+            if raw_wait_s is None:
+                raw_wait_s = data.get("wait", None)
 
-        # permite 0..MAX
-        wait_s = max(0, min(wait_s, int(TFA_CONSUME_WAIT_MAX)))
+            if raw_wait_s is None or str(raw_wait_s).strip() == "":
+                wait_ms = int(TFA_CONSUME_WAIT_DEFAULT_MS)
+            else:
+                wait_ms = int(float(str(raw_wait_s).strip()) * 1000.0)
+
+        wait_ms = max(0, min(wait_ms, int(TFA_CONSUME_WAIT_MAX_MS)))
     except Exception:
-        wait_s = int(TFA_CONSUME_WAIT_DEFAULT)
+        wait_ms = int(TFA_CONSUME_WAIT_DEFAULT_MS)
 
     # FAST PATH: wait=0 -> 1 leitura e retorna imediatamente (sem loop/sleep)
-    if wait_s <= 0:
+    if wait_ms <= 0:
         r = _redis_xread_events(trader_key, cursor, count)
         if not r.get("ok"):
             return jsonify({"ok": False, "error": "redis_xread_failed", "detail": r}), 500
@@ -870,46 +925,28 @@ def consume_events_wait():
             "waited_s": 0.0
         }), 200
 
-    deadline = time.time() + float(wait_s)
-    sleep_ms = max(0.05, min(TFA_LONGPOLL_SLEEP_MS, 0.50))
+    t0 = time.time()
+    r = _redis_xread_events_block(trader_key, cursor, count, wait_ms)
+    if not r.get("ok"):
+        return jsonify({"ok": False, "error": "redis_xread_failed", "detail": r}), 500
 
-    while True:
-        r = _redis_xread_events(trader_key, cursor, count)
-        if not r.get("ok"):
-            return jsonify({"ok": False, "error": "redis_xread_failed", "detail": r}), 500
+    events_out = r.get("events", []) or []
 
-        events_out = r.get("events", []) or []
-        if events_out:
-            with _METRICS_LOCK:
-                _METRICS["consume_ok_total"] += 1
-                _METRICS["consume_events_total"] += len(events_out)
+    with _METRICS_LOCK:
+        _METRICS["consume_ok_total"] += 1
+        _METRICS["consume_events_total"] += len(events_out)
 
-            return jsonify({
-                "ok": True,
-                "trader_key": trader_key,
-                "stream": r.get("stream"),
-                "cursor": cursor,
-                "next_cursor": r.get("next_cursor"),
-                "events": events_out,
-                "waited_s": round(float(wait_s) - max(0.0, deadline - time.time()), 3)
-            }), 200
+    waited_s = round(time.time() - t0, 3)
 
-        # sem eventos ainda
-        if time.time() >= deadline:
-            with _METRICS_LOCK:
-                _METRICS["consume_ok_total"] += 1
-
-            return jsonify({
-                "ok": True,
-                "trader_key": trader_key,
-                "stream": r.get("stream"),
-                "cursor": cursor,
-                "next_cursor": cursor,
-                "events": [],
-                "waited_s": float(wait_s)
-            }), 200
-
-        time.sleep(sleep_ms)
+    return jsonify({
+        "ok": True,
+        "trader_key": trader_key,
+        "stream": r.get("stream"),
+        "cursor": cursor,
+        "next_cursor": r.get("next_cursor"),
+        "events": events_out,
+        "waited_s": waited_s
+    }), 200
 
 def _iter_ndjson(objs: Iterable[Dict[str, Any]]):
     for obj in objs:
