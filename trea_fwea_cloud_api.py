@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """
-TREA & FWEA – Cloud API (Etapa 14 – Fase Cloud Real / Migração)
+TREA & FWEA – Cloud API
+Versão: trea_fwea_cloud_api - 20260210_40
+Status: Premium SSE (base Pasta 49)
 
 Endpoints (v1):
   • POST /api/v1/events/publish        - recebe eventos do TREA (JSON)
@@ -27,7 +29,7 @@ from urllib.parse import parse_qs, unquote_plus
 from typing import Any, Dict, Iterable, List
 from functools import wraps
 
-from flask import Flask, request, jsonify, Response
+from flask import Flask, request, jsonify, Response, stream_with_context
 from flask_cors import CORS
 
 # ========================= Config =========================
@@ -712,29 +714,24 @@ def publish_event():
         evt["event_id"] = event_id
 
     evt["server_ts"] = int(time.time())
+    evt["cloud_pub_ms"] = int(time.time() * 1000)
 
     # --- Redis Streams (Fase 1) ---
     if TFA_REDIS_STREAMS:
-        is_new = _redis_set_dedupe_if_new(trader_key, event_id)
-        if not is_new:
-            with _METRICS_LOCK:
-                _METRICS["publish_ok_total"] += 1
-                _METRICS["publish_duplicate_total"] += 1
-
-            return jsonify({
-                "ok": True,
-                "duplicate": True,
-                "event_id": event_id,
-                "trader_key": trader_key
-            }), 200
-
+        # TEMP: desabilitar dedupe para garantir XADD no stream
         r = _redis_xadd_event(evt)
         if not r.get("ok"):
             return jsonify({
                 "ok": False,
                 "error": "redis_xadd_failed",
-                "detail": r
+                "detail": r,
+                "cloud_pub_ms": evt["cloud_pub_ms"],
             }), 500
+
+        try:
+            print(f"API_PUBLISH_OK trader_key={trader_key} stream={r.get('stream')} redis_id={r.get('redis_id')}", flush=True)
+        except Exception:
+            pass
 
         with _METRICS_LOCK:
             _METRICS["publish_ok_total"] += 1
@@ -745,8 +742,10 @@ def publish_event():
             "trader_key": trader_key,
             "redis_stream": r.get("stream"),
             "redis_id": r.get("redis_id"),
-            "server_ts": evt["server_ts"]
+            "server_ts": evt["server_ts"],
+            "cloud_pub_ms": evt["cloud_pub_ms"],
         }), 200
+
 
 
     # --- fallback legado ---
@@ -911,6 +910,20 @@ def consume_events_wait():
 
         events_out = r.get("events", []) or []
 
+        # --- Cloud queue latency: publish -> consume (ms) ---
+        now_ms = int(time.time() * 1000)
+        if events_out:
+            for e in events_out:
+                try:
+                    pub_ms = int(e.get("cloud_pub_ms", 0) or 0)
+                except Exception:
+                    pub_ms = 0
+                if pub_ms > 0:
+                    e["cloud_queue_dt_ms"] = max(0, now_ms - pub_ms)
+                else:
+                    e["cloud_queue_dt_ms"] = -1  # sem pub_ms (evento antigo)
+                e["cloud_consume_ms"] = now_ms
+
         with _METRICS_LOCK:
             _METRICS["consume_ok_total"] += 1
             _METRICS["consume_events_total"] += len(events_out)
@@ -986,6 +999,87 @@ def stream_ndjson():
     except Exception as e:
         return jsonify({"error": f"internal: {e}"}), 500
 
+@app.get("/api/v1/events/stream_sse")
+@require_token_flexible
+def stream_sse():
+    """
+    SSE (Server-Sent Events) stream:
+      - Mantém conexão aberta
+      - Envia eventos assim que chegam (push real)
+      - Cursor é Redis Stream ID (ex: 1770...-0)
+    Query:
+      - trader_key=...
+      - cursor=latest | $ | 0-0 | <redis_id>
+      - block_ms= (opcional) default 25000
+      - keepalive_s= (opcional) default 15
+    """
+    trader_key = (request.args.get("trader_key") or "").strip()
+    if not trader_key:
+        return jsonify({"ok": False, "error": "missing_trader_key"}), 400
+
+    cursor = (request.args.get("cursor") or "latest").strip()
+    try:
+        block_ms = int(request.args.get("block_ms") or "25000")
+    except Exception:
+        block_ms = 25000
+    block_ms = max(1, min(block_ms, int(TFA_CONSUME_WAIT_MAX_MS)))
+
+    try:
+        keepalive_s = int(request.args.get("keepalive_s") or "15")
+    except Exception:
+        keepalive_s = 15
+    keepalive_s = max(5, min(keepalive_s, 60))
+
+    # cursor=latest/$ -> começa do tail (não manda backlog)
+    if cursor.lower() in ("latest", "$"):
+        stream = _stream_name(trader_key)
+        last_id = "0-0"
+        try:
+            rr = _upstash_cmd(["XREVRANGE", stream, "+", "-", "COUNT", "1"])
+            if isinstance(rr, dict) and rr.get("result"):
+                last_id = str(rr["result"][0][0])
+        except Exception:
+            last_id = "0-0"
+        cursor = last_id
+
+    @stream_with_context
+    def gen():
+        nonlocal cursor
+        last_keepalive = time.time()
+
+        # headers SSE: primeiro "hello"
+        yield ": connected\n\n"
+
+        while True:
+            r = _redis_xread_events_block(trader_key, cursor, 50, block_ms)
+            if not r.get("ok"):
+                # envia erro e encerra
+                err = {"ok": False, "error": "redis_xread_failed", "detail": r}
+                yield f"event: error\ndata: {json.dumps(err, separators=(',',':'))}\n\n"
+                return
+
+            events_out = r.get("events", []) or []
+            if events_out:
+                for evt in events_out:
+                    # envia 1 evento por mensagem SSE
+                    payload = json.dumps(evt, ensure_ascii=False, separators=(",", ":"))
+                    yield f"data: {payload}\n\n"
+                # avança cursor
+                cursor = str(r.get("next_cursor") or cursor)
+
+            # keepalive (para não morrer por timeout/proxy)
+            now = time.time()
+            if now - last_keepalive >= keepalive_s:
+                yield f": keepalive {int(now)}\n\n"
+                last_keepalive = now
+
+    headers = {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no",  # ajuda em alguns proxies
+    }
+    return Response(gen(), headers=headers)
 
 # ======================== Main ============================
 if __name__ == "__main__":
