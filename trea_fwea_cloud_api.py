@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 TREA & FWEA – Cloud API
-Versão: trea_fwea_cloud_api - 20260210_40
-Status: Premium SSE (base Pasta 49)
+Versão: trea_fwea_cloud_api - 20260213_41
+Status: Premium SSE (base Pasta 51)
 
 Endpoints (v1):
   • POST /api/v1/events/publish        - recebe eventos do TREA (JSON)
@@ -495,7 +495,7 @@ def _redis_xadd_event(evt: Dict[str, Any]) -> Dict[str, Any]:
         "event_id", str(evt.get("event_id", "")),
         "seq", str(evt.get("seq", 0)),
         "ts", str(evt.get("ts", 0)),
-        "server_ts", str(int(time.time())),
+        "server_ts", str(int(evt.get("server_ts", int(time.time())))),
         "action", str(evt.get("action", "")),
         "symbol", str(evt.get("symbol", "")),
         "position_id", str(evt.get("position_id", 0)),
@@ -524,6 +524,9 @@ def _redis_xread_events(trader_key: str, cursor: str, count: int) -> Dict[str, A
     tk = (trader_key or "").strip()
     stream = _stream_name(tk)
     cur = (cursor or "0-0").strip()
+    # proteção anti-replay: se cur não tiver "-", força formato Redis ID
+    if "-" not in cur:
+        cur = f"{cur}-0"
 
     # XREAD COUNT <n> STREAMS <stream> <cursor>
     r = _upstash_cmd(["XREAD", "COUNT", str(max(1, count)), "STREAMS", stream, cur])
@@ -568,6 +571,9 @@ def _redis_xread_events_block(trader_key: str, cursor: str, count: int, block_ms
     tk = (trader_key or "").strip()
     stream = _stream_name(tk)
     cur = (cursor or "0-0").strip()
+    # proteção anti-replay: se cur não tiver "-", força formato Redis ID
+    if "-" not in cur:
+        cur = f"{cur}-0"
 
     ms = int(block_ms)
     ms = max(1, min(ms, int(TFA_CONSUME_WAIT_MAX_MS)))
@@ -658,6 +664,7 @@ def health():
 
     return jsonify({"status": "ok", "ts": int(time.time()), **s})
 
+
 @app.post("/api/v1/metrics/reset")
 @require_token_flexible
 def metrics_reset():
@@ -673,6 +680,7 @@ def metrics_reset():
 
     return jsonify({"ok": True, "ts": int(time.time()), "metrics": dict(_METRICS)}), 200
 
+
 @app.get("/api/v1/metrics")
 @require_token_flexible
 def metrics():
@@ -680,11 +688,14 @@ def metrics():
         snap = dict(_METRICS)
     return jsonify({"ok": True, "ts": int(time.time()), "metrics": snap}), 200
 
+
 @app.post("/api/v1/events/publish")
 @require_token_flexible
 def publish_event():
     try:
         evt = parse_json_body()
+        api_recv_ms = int(time.time() * 1000)
+        evt["api_recv_ms"] = api_recv_ms
     except ValueError as ve:
         raw_dbg = request.get_data(cache=True, as_text=True)
         return jsonify({
@@ -696,14 +707,12 @@ def publish_event():
     except Exception as e:
         return jsonify({"ok": False, "error": f"internal_parse:{e}"}), 500
 
-    # --- validações mínimas ---
     trader_key = (evt.get("trader_key") or "").strip()
     if not trader_key:
         return jsonify({"ok": False, "error": "missing_trader_key"}), 400
 
     event_id = (evt.get("event_id") or "").strip()
     if not event_id:
-        # gera event_id determinístico a partir do payload do TREA
         event_id = (
             f"{trader_key}|"
             f"{evt.get('seq',0)}|"
@@ -713,12 +722,25 @@ def publish_event():
         )
         evt["event_id"] = event_id
 
-    evt["server_ts"] = int(time.time())
+    evt["server_ts"] = int(api_recv_ms / 1000)
     evt["cloud_pub_ms"] = int(time.time() * 1000)
 
-    # --- Redis Streams (Fase 1) ---
     if TFA_REDIS_STREAMS:
-        # TEMP: desabilitar dedupe para garantir XADD no stream
+        is_new = _redis_set_dedupe_if_new(trader_key, event_id)
+        if not is_new:
+            with _METRICS_LOCK:
+                _METRICS["publish_ok_total"] += 1
+                _METRICS["publish_duplicate_total"] += 1
+
+            return jsonify({
+                "ok": True,
+                "duplicate": True,
+                "event_id": event_id,
+                "trader_key": trader_key,
+                "api_recv_ms": evt.get("api_recv_ms", 0),
+                "cloud_pub_ms": evt.get("cloud_pub_ms", 0),
+            }), 200
+
         r = _redis_xadd_event(evt)
         if not r.get("ok"):
             return jsonify({
@@ -743,24 +765,59 @@ def publish_event():
             "redis_stream": r.get("stream"),
             "redis_id": r.get("redis_id"),
             "server_ts": evt["server_ts"],
+            "api_recv_ms": evt.get("api_recv_ms", 0),
             "cloud_pub_ms": evt["cloud_pub_ms"],
         }), 200
 
-
-
-    # --- fallback legado ---
     STORE.add(evt)
     return jsonify({
         "ok": True,
         "legacy": True,
         "event_id": event_id,
-        "trader_key": trader_key
+        "trader_key": trader_key,
+        "api_recv_ms": evt.get("api_recv_ms", 0),
+        "cloud_pub_ms": evt.get("cloud_pub_ms", 0),
+        "server_ts": evt.get("server_ts", 0),
     }), 200
+
+
+@app.post("/api/v1/events/ack")
+@require_token_flexible
+def ack_event():
+    try:
+        b = parse_json_body()
+    except Exception:
+        b = {}
+
+    trader_key = (b.get("trader_key") or "").strip()
+    event_id   = (b.get("event_id") or "").strip()
+    redis_id   = (b.get("redis_id") or b.get("_redis_id") or "").strip()
+
+    if not trader_key:
+        return jsonify({"ok": False, "error": "missing_trader_key"}), 400
+    if not event_id and not redis_id:
+        return jsonify({"ok": False, "error": "missing_event_id_or_redis_id"}), 400
+
+    api_ack_ms = int(time.time() * 1000)
+
+    key = f"tfa:ack:{trader_key}:{event_id or redis_id}"
+    r = _upstash_cmd(["SET", key, str(api_ack_ms), "PX", "86400000"])  # 24h
+
+    if not isinstance(r, dict) or r.get("result") not in ("OK", True):
+        return jsonify({"ok": False, "error": "ack_set_failed", "detail": r}), 500
+
+    return jsonify({
+        "ok": True,
+        "trader_key": trader_key,
+        "event_id": event_id,
+        "redis_id": redis_id,
+        "api_ack_ms": api_ack_ms
+    }), 200
+
 
 @app.route("/api/v1/events/consume", methods=["GET", "POST"])
 @require_token_flexible
 def consume_events():
-    # GET (legado) ou POST (novo)
     if request.method == "POST":
         try:
             b = parse_json_body()
@@ -785,15 +842,10 @@ def consume_events():
     if not trader_key:
         return jsonify({"ok": False, "error": "missing_trader_key"}), 400
 
-    # --- Redis Streams (Fase 1) ---
     if TFA_REDIS_STREAMS:
         r = _redis_xread_events(trader_key, cursor, count)
         if not r.get("ok"):
-            return jsonify({
-                "ok": False,
-                "error": "redis_xread_failed",
-                "detail": r
-            }), 500
+            return jsonify({"ok": False, "error": "redis_xread_failed", "detail": r}), 500
 
         events_out = r.get("events", []) or []
 
@@ -810,13 +862,12 @@ def consume_events():
             "events": events_out
         }), 200
 
-    # --- fallback legado (NDJSON) ---
     try:
         since_id = int(cursor.split("-")[0]) if cursor else 0
     except Exception:
         since_id = 0
-    events = STORE.since(since_id)
 
+    events = STORE.since(since_id)
     next_cursor = cursor
     if events:
         next_cursor = str(events[-1].get("id", since_id))
@@ -830,15 +881,10 @@ def consume_events():
         "events": events
     }), 200
 
+
 @app.route("/api/v1/events/consume_wait", methods=["GET", "POST"])
 @require_token_flexible
 def consume_events_wait():
-    """
-    Long-poll simples:
-      - espera até wait segundos por eventos novos
-      - retorna imediatamente se houver evento
-      - se não houver, retorna events=[] com next_cursor igual ao cursor recebido
-    """
     try:
         data = parse_json_body()
     except Exception:
@@ -847,9 +893,6 @@ def consume_events_wait():
     trader_key = (request.args.get("trader_key") or data.get("trader_key") or data.get("feed_id") or "").strip()
     cursor     = (request.args.get("cursor")     or data.get("cursor")     or "0-0").strip()
 
-    # ---------------------------------------------------------
-    # cursor=latest  -> inicia do "tail" do stream (anti-backlog)
-    # ---------------------------------------------------------
     if not trader_key:
         return jsonify({"ok": False, "error": "missing_trader_key"}), 400
 
@@ -857,7 +900,6 @@ def consume_events_wait():
         stream = _stream_name(trader_key)
         last_id = "0-0"
         try:
-            # XREVRANGE <stream> + - COUNT 1  -> pega o último ID
             rr = _upstash_cmd(["XREVRANGE", stream, "+", "-", "COUNT", "1"])
             if isinstance(rr, dict) and rr.get("result"):
                 last_id = str(rr["result"][0][0])
@@ -880,7 +922,6 @@ def consume_events_wait():
     except Exception:
         count = TFA_CONSUME_COUNT
 
-    # Premium: preferir wait_ms (milissegundos). Fallback: wait (segundos).
     try:
         raw_wait_ms = request.args.get("wait_ms", None)
         if raw_wait_ms is None:
@@ -902,7 +943,6 @@ def consume_events_wait():
     except Exception:
         wait_ms = int(TFA_CONSUME_WAIT_DEFAULT_MS)
 
-    # FAST PATH: wait=0 -> 1 leitura e retorna imediatamente (sem loop/sleep)
     if wait_ms <= 0:
         r = _redis_xread_events(trader_key, cursor, count)
         if not r.get("ok"):
@@ -910,7 +950,36 @@ def consume_events_wait():
 
         events_out = r.get("events", []) or []
 
-        # --- Cloud queue latency: publish -> consume (ms) ---
+        if events_out:
+            for e in events_out:
+                try:
+                    api_recv_ms = int(e.get("api_recv_ms", 0) or 0)
+                except Exception:
+                    api_recv_ms = 0
+
+                eid = (e.get("event_id") or "").strip()
+                rid = (e.get("_redis_id") or "").strip()
+
+                ack_key = ""
+                if eid:
+                    ack_key = f"tfa:ack:{trader_key}:{eid}"
+                elif rid:
+                    ack_key = f"tfa:ack:{trader_key}:{rid}"
+
+                api_ack_ms = 0
+                if ack_key:
+                    rr = _upstash_cmd(["GET", ack_key])
+                    if isinstance(rr, dict) and rr.get("result"):
+                        try:
+                            api_ack_ms = int(rr["result"])
+                        except Exception:
+                            api_ack_ms = 0
+
+                if api_ack_ms > 0:
+                    e["api_ack_ms"] = api_ack_ms
+                    if api_recv_ms > 0 and api_ack_ms >= api_recv_ms:
+                        e["end_to_end_official_ms"] = int(api_ack_ms - api_recv_ms)
+
         now_ms = int(time.time() * 1000)
         if events_out:
             for e in events_out:
@@ -921,7 +990,7 @@ def consume_events_wait():
                 if pub_ms > 0:
                     e["cloud_queue_dt_ms"] = max(0, now_ms - pub_ms)
                 else:
-                    e["cloud_queue_dt_ms"] = -1  # sem pub_ms (evento antigo)
+                    e["cloud_queue_dt_ms"] = -1
                 e["cloud_consume_ms"] = now_ms
 
         with _METRICS_LOCK:
@@ -945,6 +1014,36 @@ def consume_events_wait():
 
     events_out = r.get("events", []) or []
 
+    if events_out:
+        for e in events_out:
+            try:
+                api_recv_ms = int(e.get("api_recv_ms", 0) or 0)
+            except Exception:
+                api_recv_ms = 0
+
+            eid = (e.get("event_id") or "").strip()
+            rid = (e.get("_redis_id") or "").strip()
+
+            ack_key = ""
+            if eid:
+                ack_key = f"tfa:ack:{trader_key}:{eid}"
+            elif rid:
+                ack_key = f"tfa:ack:{trader_key}:{rid}"
+
+            api_ack_ms = 0
+            if ack_key:
+                rr = _upstash_cmd(["GET", ack_key])
+                if isinstance(rr, dict) and rr.get("result"):
+                    try:
+                        api_ack_ms = int(rr["result"])
+                    except Exception:
+                        api_ack_ms = 0
+
+            if api_ack_ms > 0:
+                e["api_ack_ms"] = api_ack_ms
+                if api_recv_ms > 0 and api_ack_ms >= api_recv_ms:
+                    e["end_to_end_official_ms"] = int(api_ack_ms - api_recv_ms)
+
     with _METRICS_LOCK:
         _METRICS["consume_ok_total"] += 1
         _METRICS["consume_events_total"] += len(events_out)
@@ -961,25 +1060,19 @@ def consume_events_wait():
         "waited_s": waited_s
     }), 200
 
+
 def _iter_ndjson(objs: Iterable[Dict[str, Any]]):
     for obj in objs:
         yield json.dumps(obj, separators=(",", ":")) + "\n"
 
+
 @app.get("/api/v1/events/stream_ndjson")
 @require_token_flexible
 def stream_ndjson():
-    """
-    NDJSON stream para o FWEA.
-
-    Compatibilidade:
-      - Legado: ?since=<id>  -> retorna eventos com id > since
-      - Novo (Opção B): ?trader_key=XXX&since_seq=YYY -> retorna eventos com seq > since_seq (ordenado por seq)
-    """
     try:
         trader_key = (request.args.get("trader_key", "") or "").strip()
         since_seq_raw = (request.args.get("since_seq", "") or "").strip()
 
-        # --- Novo cursor por SEQ ---
         if trader_key and since_seq_raw != "":
             try:
                 since_seq = int(since_seq_raw)
@@ -988,31 +1081,21 @@ def stream_ndjson():
             events = STORE.since_seq(trader_key, since_seq)
             return Response(_iter_ndjson(events), mimetype="application/x-ndjson")
 
-        # --- Legado por id ---
         since_raw = (request.args.get("since", "0") or "0").strip()
         try:
             since_id = int(since_raw)
         except Exception:
             since_id = 0
+
         events = STORE.since(since_id)
         return Response(_iter_ndjson(events), mimetype="application/x-ndjson")
     except Exception as e:
         return jsonify({"error": f"internal: {e}"}), 500
 
+
 @app.get("/api/v1/events/stream_sse")
 @require_token_flexible
 def stream_sse():
-    """
-    SSE (Server-Sent Events) stream:
-      - Mantém conexão aberta
-      - Envia eventos assim que chegam (push real)
-      - Cursor é Redis Stream ID (ex: 1770...-0)
-    Query:
-      - trader_key=...
-      - cursor=latest | $ | 0-0 | <redis_id>
-      - block_ms= (opcional) default 25000
-      - keepalive_s= (opcional) default 15
-    """
     trader_key = (request.args.get("trader_key") or "").strip()
     if not trader_key:
         return jsonify({"ok": False, "error": "missing_trader_key"}), 400
@@ -1030,7 +1113,6 @@ def stream_sse():
         keepalive_s = 15
     keepalive_s = max(5, min(keepalive_s, 60))
 
-    # cursor=latest/$ -> começa do tail (não manda backlog)
     if cursor.lower() in ("latest", "$"):
         stream = _stream_name(trader_key)
         last_id = "0-0"
@@ -1046,14 +1128,11 @@ def stream_sse():
     def gen():
         nonlocal cursor
         last_keepalive = time.time()
-
-        # headers SSE: primeiro "hello"
         yield ": connected\n\n"
 
         while True:
             r = _redis_xread_events_block(trader_key, cursor, 50, block_ms)
             if not r.get("ok"):
-                # envia erro e encerra
                 err = {"ok": False, "error": "redis_xread_failed", "detail": r}
                 yield f"event: error\ndata: {json.dumps(err, separators=(',',':'))}\n\n"
                 return
@@ -1061,13 +1140,10 @@ def stream_sse():
             events_out = r.get("events", []) or []
             if events_out:
                 for evt in events_out:
-                    # envia 1 evento por mensagem SSE
                     payload = json.dumps(evt, ensure_ascii=False, separators=(",", ":"))
                     yield f"data: {payload}\n\n"
-                # avança cursor
                 cursor = str(r.get("next_cursor") or cursor)
 
-            # keepalive (para não morrer por timeout/proxy)
             now = time.time()
             if now - last_keepalive >= keepalive_s:
                 yield f": keepalive {int(now)}\n\n"
@@ -1077,12 +1153,12 @@ def stream_sse():
         "Content-Type": "text/event-stream",
         "Cache-Control": "no-cache",
         "Connection": "keep-alive",
-        "X-Accel-Buffering": "no",  # ajuda em alguns proxies
+        "X-Accel-Buffering": "no",
     }
     return Response(gen(), headers=headers)
+
 
 # ======================== Main ============================
 if __name__ == "__main__":
     app.run(host=HOST, port=PORT, threaded=True)
-
 
