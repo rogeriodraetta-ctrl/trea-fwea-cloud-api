@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 TREA & FWEA – Cloud API
-Versão: trea_fwea_cloud_api - 20260213_41
-Status: Premium SSE (base Pasta 51)
+Versão: trea_fwea_cloud_api - 20260216_43
+Status: Premium SSE (base Pasta 53)
 
 Endpoints (v1):
   • POST /api/v1/events/publish        - recebe eventos do TREA (JSON)
@@ -436,8 +436,13 @@ def _upstash_cmd(args: List[str]) -> Dict[str, Any]:
         resp = _UPSTASH_SESSION.post(
             UPSTASH_REDIS_REST_URL,
             data=json.dumps(args).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {UPSTASH_REDIS_REST_TOKEN}",
+                "Content-Type": "application/json",
+            },
             timeout=(UPSTASH_CONNECT_TIMEOUT, UPSTASH_READ_TIMEOUT),
         )
+
         raw = resp.text or ""
         if resp.status_code >= 400:
             if TFA_LOG_UPSTASH_ERRORS:
@@ -487,6 +492,10 @@ def _redis_xadd_event(evt: Dict[str, Any]) -> Dict[str, Any]:
         trader_key = f"trader_{evt.get('trader_id','')}".strip()
 
     stream = _stream_name(trader_key)
+    # SLA (server-side): carimbo de entrada e saída
+    evt.setdefault("api_in_ms", int(time.time() * 1000))   # segurança (não deveria faltar)
+    evt["api_out_ms"] = int(time.time() * 1000)            # momento do "emit" no stream
+
     evt_json = json.dumps(evt, ensure_ascii=False, separators=(",", ":"))
 
     # Campos indexáveis + payload completo em "json"
@@ -496,6 +505,8 @@ def _redis_xadd_event(evt: Dict[str, Any]) -> Dict[str, Any]:
         "seq", str(evt.get("seq", 0)),
         "ts", str(evt.get("ts", 0)),
         "server_ts", str(int(evt.get("server_ts", int(time.time())))),
+        "api_in_ms", str(evt.get("api_in_ms", 0)),
+        "api_out_ms", str(evt.get("api_out_ms", 0)),
         "action", str(evt.get("action", "")),
         "symbol", str(evt.get("symbol", "")),
         "position_id", str(evt.get("position_id", 0)),
@@ -662,7 +673,7 @@ def health():
     s["consume_wait_max"] = int(TFA_CONSUME_WAIT_MAX)
     s["consume_count_default"] = int(TFA_CONSUME_COUNT)
 
-    return jsonify({"status": "ok", "ts": int(time.time()), **s})
+    return jsonify({"status": "ok", "ts": int(time.time()), "server_ms": int(time.time() * 1000), **s})
 
 
 @app.post("/api/v1/metrics/reset")
@@ -694,8 +705,8 @@ def metrics():
 def publish_event():
     try:
         evt = parse_json_body()
-        api_recv_ms = int(time.time() * 1000)
-        evt["api_recv_ms"] = api_recv_ms
+        api_in_ms = int(time.time() * 1000)
+        evt["api_in_ms"] = api_in_ms
     except ValueError as ve:
         raw_dbg = request.get_data(cache=True, as_text=True)
         return jsonify({
@@ -722,7 +733,7 @@ def publish_event():
         )
         evt["event_id"] = event_id
 
-    evt["server_ts"] = int(api_recv_ms / 1000)
+    evt["server_ts"] = int(api_in_ms / 1000)
     evt["cloud_pub_ms"] = int(time.time() * 1000)
 
     if TFA_REDIS_STREAMS:
@@ -734,10 +745,11 @@ def publish_event():
 
             return jsonify({
                 "ok": True,
+                "server_ms": int(time.time() * 1000),
                 "duplicate": True,
                 "event_id": event_id,
                 "trader_key": trader_key,
-                "api_recv_ms": evt.get("api_recv_ms", 0),
+                "api_in_ms": evt.get("api_in_ms", 0),
                 "cloud_pub_ms": evt.get("cloud_pub_ms", 0),
             }), 200
 
@@ -760,22 +772,24 @@ def publish_event():
 
         return jsonify({
             "ok": True,
+            "server_ms": int(time.time() * 1000),
             "event_id": event_id,
             "trader_key": trader_key,
             "redis_stream": r.get("stream"),
             "redis_id": r.get("redis_id"),
             "server_ts": evt["server_ts"],
-            "api_recv_ms": evt.get("api_recv_ms", 0),
+            "api_in_ms": evt.get("api_in_ms", 0),
             "cloud_pub_ms": evt["cloud_pub_ms"],
         }), 200
 
     STORE.add(evt)
     return jsonify({
         "ok": True,
+        "server_ms": int(time.time() * 1000),
         "legacy": True,
         "event_id": event_id,
         "trader_key": trader_key,
-        "api_recv_ms": evt.get("api_recv_ms", 0),
+        "api_in_ms": evt.get("api_in_ms", 0),
         "cloud_pub_ms": evt.get("cloud_pub_ms", 0),
         "server_ts": evt.get("server_ts", 0),
     }), 200
@@ -855,6 +869,7 @@ def consume_events():
 
         return jsonify({
             "ok": True,
+            "server_ms": int(time.time() * 1000),
             "trader_key": trader_key,
             "stream": r.get("stream"),
             "cursor": cursor,
@@ -874,6 +889,7 @@ def consume_events():
 
     return jsonify({
         "ok": True,
+        "server_ms": int(time.time() * 1000),
         "legacy": True,
         "trader_key": trader_key,
         "cursor": cursor,
@@ -908,12 +924,13 @@ def consume_events_wait():
 
         return jsonify({
             "ok": True,
+            "server_ms": int(time.time() * 1000),
             "trader_key": trader_key,
             "stream": stream,
             "cursor": cursor,
             "next_cursor": last_id,
             "events": [],
-            "waited_s": 0.0
+            "waited_ms": 0
         }), 200
 
     try:
@@ -953,9 +970,9 @@ def consume_events_wait():
         if events_out:
             for e in events_out:
                 try:
-                    api_recv_ms = int(e.get("api_recv_ms", 0) or 0)
+                    api_in_ms = int(e.get("api_in_ms", 0) or 0)
                 except Exception:
-                    api_recv_ms = 0
+                    api_in_ms = 0
 
                 eid = (e.get("event_id") or "").strip()
                 rid = (e.get("_redis_id") or "").strip()
@@ -977,8 +994,8 @@ def consume_events_wait():
 
                 if api_ack_ms > 0:
                     e["api_ack_ms"] = api_ack_ms
-                    if api_recv_ms > 0 and api_ack_ms >= api_recv_ms:
-                        e["end_to_end_official_ms"] = int(api_ack_ms - api_recv_ms)
+                    if api_in_ms > 0 and api_ack_ms >= api_in_ms:
+                        e["end_to_end_official_ms"] = int(api_ack_ms - api_in_ms)
 
         now_ms = int(time.time() * 1000)
         if events_out:
@@ -999,12 +1016,13 @@ def consume_events_wait():
 
         return jsonify({
             "ok": True,
+            "server_ms": int(time.time() * 1000),
             "trader_key": trader_key,
             "stream": r.get("stream"),
             "cursor": cursor,
             "next_cursor": r.get("next_cursor"),
             "events": events_out,
-            "waited_s": 0.0
+            "waited_ms": 0
         }), 200
 
     t0 = time.time()
@@ -1017,9 +1035,9 @@ def consume_events_wait():
     if events_out:
         for e in events_out:
             try:
-                api_recv_ms = int(e.get("api_recv_ms", 0) or 0)
+                api_in_ms = int(e.get("api_in_ms", 0) or 0)
             except Exception:
-                api_recv_ms = 0
+                api_in_ms = 0
 
             eid = (e.get("event_id") or "").strip()
             rid = (e.get("_redis_id") or "").strip()
@@ -1041,23 +1059,24 @@ def consume_events_wait():
 
             if api_ack_ms > 0:
                 e["api_ack_ms"] = api_ack_ms
-                if api_recv_ms > 0 and api_ack_ms >= api_recv_ms:
-                    e["end_to_end_official_ms"] = int(api_ack_ms - api_recv_ms)
+                if api_in_ms > 0 and api_ack_ms >= api_in_ms:
+                    e["end_to_end_official_ms"] = int(api_ack_ms - api_in_ms)
 
     with _METRICS_LOCK:
         _METRICS["consume_ok_total"] += 1
         _METRICS["consume_events_total"] += len(events_out)
 
-    waited_s = round(time.time() - t0, 3)
+    waited_ms = int((time.time() - t0) * 1000)
 
     return jsonify({
         "ok": True,
+        "server_ms": int(time.time() * 1000),
         "trader_key": trader_key,
         "stream": r.get("stream"),
         "cursor": cursor,
         "next_cursor": r.get("next_cursor"),
         "events": events_out,
-        "waited_s": waited_s
+        "waited_ms": waited_ms
     }), 200
 
 
