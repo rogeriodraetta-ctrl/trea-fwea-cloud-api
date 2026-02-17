@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 TREA & FWEA – Cloud API
-Versão: trea_fwea_cloud_api - 20260217_44
+Versão: trea_fwea_cloud_api - 20260217_45
 Status: Premium SSE (base Pasta 54)
 
 Endpoints (v1):
@@ -207,6 +207,27 @@ class EventStore:
 
 PERSIST_PATH = os.getenv("TFA_PERSIST_PATH", "/tmp/trea_fwea_events.jsonl")
 STORE = EventStore(persist_path=PERSIST_PATH)
+
+# ===================== Telemetry Store (by trader_key+seq) =====================
+_TELEM_LOCK = threading.RLock()
+_TELEM_BY_KEYSEQ = {}  # key = f"{trader_key}|{seq}" -> {"t_post_start_ms":..., "dt_post_ms":..., "telemetry_api_in_ms":...}
+
+def _telem_key(trader_key: str, seq: int) -> str:
+    return f"{(trader_key or '').strip()}|{int(seq)}"
+
+def _telem_put(trader_key: str, seq: int, t_post_start_ms: int, dt_post_ms: float, api_in_ms: int) -> None:
+    k = _telem_key(trader_key, seq)
+    with _TELEM_LOCK:
+        _TELEM_BY_KEYSEQ[k] = {
+            "t_post_start_ms": int(t_post_start_ms or 0),
+            "dt_post_ms": float(dt_post_ms or 0.0),
+            "telemetry_api_in_ms": int(api_in_ms or 0),
+        }
+
+def _telem_get(trader_key: str, seq: int):
+    k = _telem_key(trader_key, seq)
+    with _TELEM_LOCK:
+        return _TELEM_BY_KEYSEQ.get(k)
 
 # ======================== Metrics =========================
 _METRICS_LOCK = threading.RLock()
@@ -824,6 +845,8 @@ def events_telemetry():
         return jsonify({"ok": False, "error": "missing_seq"}), 400
 
     api_in_ms = int(time.time() * 1000)
+    # Guarda telemetria por trader_key+seq (para anexar no /consume)
+    _telem_put(trader_key, seq, t_post_start_ms, dt_post_ms, api_in_ms)
 
     # MVP: apenas ACK + log. (No PASSO 6 vamos acoplar isso ao evento e repassar ao FWEA)
     try:
@@ -911,6 +934,19 @@ def consume_events():
             return jsonify({"ok": False, "error": "redis_xread_failed", "detail": r}), 500
 
         events_out = r.get("events", []) or []
+
+        # Anexa telemetria (se existir) pelo par trader_key+seq
+        for e in events_out:
+            try:
+                s = int(e.get("seq", 0) or 0)
+            except Exception:
+                s = 0
+            if s > 0:
+                t = _telem_get(trader_key, s)
+                if t:
+                    e["t_post_start_ms"] = t.get("t_post_start_ms", 0)
+                    e["dt_post_ms"] = t.get("dt_post_ms", 0.0)
+                    e["telemetry_api_in_ms"] = t.get("telemetry_api_in_ms", 0)
 
         with _METRICS_LOCK:
             _METRICS["consume_ok_total"] += 1
