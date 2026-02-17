@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 TREA & FWEA – Cloud API
-Versão: trea_fwea_cloud_api - 20260217_49
+Versão: trea_fwea_cloud_api - 20260217_50
 Status: Premium SSE (base Pasta 54)
 
 Endpoints (v1):
@@ -215,6 +215,9 @@ _TELEM_BY_KEYSEQ = {}  # key = f"{trader_key}|{seq}" -> {"t_post_start_ms":..., 
 def _telem_key(trader_key: str, seq: int) -> str:
     return f"{(trader_key or '').strip()}|{int(seq)}"
 
+def _telem_redis_key(trader_key: str, seq: int) -> str:
+    return f"tfa:telem:{(trader_key or '').strip()}:{int(seq)}"
+
 def _telem_put(trader_key: str, seq: int, t_post_start_ms: int, dt_post_ms: float, api_in_ms: int) -> None:
     k = _telem_key(trader_key, seq)
     with _TELEM_LOCK:
@@ -224,10 +227,45 @@ def _telem_put(trader_key: str, seq: int, t_post_start_ms: int, dt_post_ms: floa
             "telemetry_api_in_ms": int(api_in_ms or 0),
         }
 
+def _telem_put_redis(trader_key: str, seq: int, t_post_start_ms: int, dt_post_ms: float, api_in_ms: int) -> None:
+    # guarda também no Upstash para não perder em restart / multi-instância
+    if not UPSTASH_REDIS_REST_URL or not UPSTASH_REDIS_REST_TOKEN:
+        return
+    k = _telem_redis_key(trader_key, seq)
+    payload = json.dumps({
+        "t_post_start_ms": int(t_post_start_ms or 0),
+        "dt_post_ms": float(dt_post_ms or 0.0),
+        "telemetry_api_in_ms": int(api_in_ms or 0),
+    }, separators=(",", ":"))
+    # TTL 6h
+    _upstash_cmd(["SET", k, payload, "EX", str(6 * 3600)])
+
+def _telem_get_redis(trader_key: str, seq: int):
+    if not UPSTASH_REDIS_REST_URL or not UPSTASH_REDIS_REST_TOKEN:
+        return None
+    k = _telem_redis_key(trader_key, seq)
+    rr = _upstash_cmd(["GET", k])
+    if isinstance(rr, dict) and rr.get("result"):
+        try:
+            obj = json.loads(rr["result"])
+            if isinstance(obj, dict):
+                return obj
+        except Exception:
+            return None
+    return None
+
 def _telem_get(trader_key: str, seq: int):
     k = _telem_key(trader_key, seq)
     with _TELEM_LOCK:
-        return _TELEM_BY_KEYSEQ.get(k)
+        t = _TELEM_BY_KEYSEQ.get(k)
+    if t:
+        return t
+    t = _telem_get_redis(trader_key, seq)
+    if t:
+        with _TELEM_LOCK:
+            _TELEM_BY_KEYSEQ[k] = t
+        return t
+    return None
 
 # ======================== Metrics =========================
 _METRICS_LOCK = threading.RLock()
@@ -847,6 +885,7 @@ def events_telemetry():
     api_in_ms = int(time.time() * 1000)
     # Guarda telemetria por trader_key+seq (para anexar no /consume)
     _telem_put(trader_key, seq, t_post_start_ms, dt_post_ms, api_in_ms)
+    _telem_put_redis(trader_key, seq, t_post_start_ms, dt_post_ms, api_in_ms)
 
     # MVP: apenas ACK + log. (No PASSO 6 vamos acoplar isso ao evento e repassar ao FWEA)
     try:
