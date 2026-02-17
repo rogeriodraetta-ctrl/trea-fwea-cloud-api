@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 TREA & FWEA – Cloud API
-Versão: trea_fwea_cloud_api - 20260217_47
+Versão: trea_fwea_cloud_api - 20260217_48
 Status: Premium SSE (base Pasta 54)
 
 Endpoints (v1):
@@ -1051,6 +1051,18 @@ def consume_events_wait():
             return jsonify({"ok": False, "error": "redis_xread_failed", "detail": r}), 500
 
         events_out = r.get("events", []) or []
+        
+        # Anexa telemetria (Strategy B) pelo par trader_key+seq
+        for e in events_out:
+            try:
+                s = int(e.get("seq", 0) or 0)
+            except Exception:
+                s = 0
+            if s > 0:
+                t = _telem_get(trader_key, s)
+                if t:
+                    e["dt_post_ms"] = float(t.get("dt_post_ms", 0.0) or 0.0)
+                    e["telemetry_api_in_ms"] = int(t.get("telemetry_api_in_ms", 0) or 0)
 
         if events_out:
             for e in events_out:
@@ -1116,6 +1128,18 @@ def consume_events_wait():
         return jsonify({"ok": False, "error": "redis_xread_failed", "detail": r}), 500
 
     events_out = r.get("events", []) or []
+    
+    # Anexa telemetria (Strategy B) pelo par trader_key+seq  [BLOCK path]
+    for e in events_out:
+        try:
+            s = int(e.get("seq", 0) or 0)
+        except Exception:
+            s = 0
+        if s > 0:
+            t = _telem_get(trader_key, s)
+            if t:
+                e["dt_post_ms"] = float(t.get("dt_post_ms", 0.0) or 0.0)
+                e["telemetry_api_in_ms"] = int(t.get("telemetry_api_in_ms", 0) or 0)
 
     if events_out:
         for e in events_out:
