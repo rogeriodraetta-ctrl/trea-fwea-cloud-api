@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 TREA & FWEA – Cloud API
-Versão: trea_fwea_cloud_api - 20260216_43
-Status: Premium SSE (base Pasta 53)
+Versão: trea_fwea_cloud_api - 20260217_44
+Status: Premium SSE (base Pasta 54)
 
 Endpoints (v1):
   • POST /api/v1/events/publish        - recebe eventos do TREA (JSON)
@@ -794,6 +794,55 @@ def publish_event():
         "server_ts": evt.get("server_ts", 0),
     }), 200
 
+@app.post("/api/v1/events/telemetry")
+@require_token_flexible
+def events_telemetry():
+    try:
+        b = parse_json_body()
+    except Exception:
+        b = {}
+
+    trader_key = (b.get("trader_key") or "").strip()
+    try:
+        seq = int(b.get("seq", 0) or 0)
+    except Exception:
+        seq = 0
+
+    try:
+        t_post_start_ms = int(b.get("t_post_start_ms", 0) or 0)
+    except Exception:
+        t_post_start_ms = 0
+
+    try:
+        dt_post_ms = float(b.get("dt_post_ms", 0.0) or 0.0)
+    except Exception:
+        dt_post_ms = 0.0
+
+    if not trader_key:
+        return jsonify({"ok": False, "error": "missing_trader_key"}), 400
+    if seq <= 0:
+        return jsonify({"ok": False, "error": "missing_seq"}), 400
+
+    api_in_ms = int(time.time() * 1000)
+
+    # MVP: apenas ACK + log. (No PASSO 6 vamos acoplar isso ao evento e repassar ao FWEA)
+    try:
+        print(
+            f"API_TELEMETRY_OK trader_key={trader_key} seq={seq} "
+            f"t_post_start_ms={t_post_start_ms} dt_post_ms={dt_post_ms:.1f}",
+            flush=True
+        )
+    except Exception:
+        pass
+
+    return jsonify({
+        "ok": True,
+        "server_ms": api_in_ms,
+        "trader_key": trader_key,
+        "seq": seq,
+        "t_post_start_ms": t_post_start_ms,
+        "dt_post_ms": dt_post_ms,
+    }), 200
 
 @app.post("/api/v1/events/ack")
 @require_token_flexible
