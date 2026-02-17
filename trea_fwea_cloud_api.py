@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 TREA & FWEA – Cloud API
-Versão: trea_fwea_cloud_api - 20260217_45
+Versão: trea_fwea_cloud_api - 20260217_46
 Status: Premium SSE (base Pasta 54)
 
 Endpoints (v1):
@@ -270,7 +270,7 @@ def require_token_flexible(fn):
         # 2.5) Fallback FINAL (MT5-safe): token no JSON BODY (apenas no /publish e /consume)
         if not token and request.method == "POST":
             p = (request.path or "")
-            if p.endswith("/api/v1/events/publish") or p.endswith("/api/v1/events/consume") or p.endswith("/api/v1/events/consume_wait"):
+            if p.endswith("/api/v1/events/publish") or p.endswith("/api/v1/events/consume") or p.endswith("/api/v1/events/consume_wait") or p.endswith("/api/v1/events/telemetry"):
                 try:
                     body_evt = parse_json_body()
                     token = (body_evt.get("token", "") or "").strip()
