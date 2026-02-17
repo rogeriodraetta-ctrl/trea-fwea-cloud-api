@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 TREA & FWEA – Cloud API
-Versão: trea_fwea_cloud_api - 20260217_46
+Versão: trea_fwea_cloud_api - 20260217_47
 Status: Premium SSE (base Pasta 54)
 
 Endpoints (v1):
@@ -944,9 +944,9 @@ def consume_events():
             if s > 0:
                 t = _telem_get(trader_key, s)
                 if t:
-                    e["t_post_start_ms"] = t.get("t_post_start_ms", 0)
-                    e["dt_post_ms"] = t.get("dt_post_ms", 0.0)
-                    e["telemetry_api_in_ms"] = t.get("telemetry_api_in_ms", 0)
+                    e["t_post_start_ms"] = int(t.get("t_post_start_ms", 0) or 0)
+                    e["dt_post_ms"] = float(t.get("dt_post_ms", 0.0) or 0.0)
+                    e["telemetry_api_in_ms"] = int(t.get("telemetry_api_in_ms", 0) or 0)
 
         with _METRICS_LOCK:
             _METRICS["consume_ok_total"] += 1
