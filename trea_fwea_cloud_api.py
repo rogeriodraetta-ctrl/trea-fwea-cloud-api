@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 TREA & FWEA – Cloud API
-Versão: trea_fwea_cloud_api - 20260217_50
+Versão: trea_fwea_cloud_api - 20260217_51
 Status: Premium SSE (base Pasta 54)
 
 Endpoints (v1):
@@ -1102,7 +1102,7 @@ def consume_events_wait():
 
                 # Se ainda não chegou telemetria, espera um pouco e tenta de novo (evita perder SLA2)
                 if not t:
-                    for _ in range(6):          # 6 tentativas
+                    for _ in range(20):          # 6 tentativas
                         time.sleep(0.05)        # 50ms cada (total ~300ms máx)
                         t = _telem_get(trader_key, s)
                         if t:
@@ -1189,7 +1189,7 @@ def consume_events_wait():
 
             # Retry curto (evita corrida publish x telemetry)
             if not t:
-                for _ in range(6):      # 6 tentativas
+                for _ in range(20):      # 6 tentativas
                     time.sleep(0.05)    # 50ms cada (total ~300ms)
                     t = _telem_get(trader_key, s)
                     if t:
