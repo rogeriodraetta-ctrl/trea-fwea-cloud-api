@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 TREA & FWEA – Cloud API
-Versão: trea_fwea_cloud_api - 20260217_51
-Status: Premium SSE (base Pasta 54)
+Versão: trea_fwea_cloud_api - 20260222_55
+Status: Premium SSE (base Pasta 58)
 
 Endpoints (v1):
   • POST /api/v1/events/publish        - recebe eventos do TREA (JSON)
@@ -906,6 +906,35 @@ def events_telemetry():
         "dt_post_ms": dt_post_ms,
     }), 200
 
+@app.get("/api/v1/events/telemetry_get")
+@require_token_flexible
+def telemetry_get():
+    trader_key = (request.args.get("trader_key") or "").strip()
+    try:
+        seq = int(request.args.get("seq") or 0)
+    except Exception:
+        seq = 0
+
+    if not trader_key:
+        return jsonify({"ok": False, "error": "missing_trader_key"}), 400
+    if seq <= 0:
+        return jsonify({"ok": False, "error": "missing_seq"}), 400
+
+    t = _telem_get(trader_key, seq)
+    if not t:
+        return jsonify({"ok": True, "found": False, "trader_key": trader_key, "seq": seq}), 200
+
+    return jsonify({
+        "ok": True,
+        "found": True,
+        "trader_key": trader_key,
+        "seq": seq,
+        "t_post_start_ms": int(t.get("t_post_start_ms", 0) or 0),
+        "dt_post_ms": float(t.get("dt_post_ms", 0.0) or 0.0),
+        "telemetry_api_in_ms": int(t.get("telemetry_api_in_ms", 0) or 0),
+        "server_ms": int(time.time() * 1000),
+    }), 200
+
 @app.post("/api/v1/events/ack")
 @require_token_flexible
 def ack_event():
@@ -986,6 +1015,13 @@ def consume_events():
                     e["t_post_start_ms"] = int(t.get("t_post_start_ms", 0) or 0)
                     e["dt_post_ms"] = float(t.get("dt_post_ms", 0.0) or 0.0)
                     e["telemetry_api_in_ms"] = int(t.get("telemetry_api_in_ms", 0) or 0)
+
+                else:
+                    # Garante campos no JSON mesmo sem telemetry
+                    e["t_post_start_ms"] = 0
+                    e["dt_post_ms"] = 0.0
+                    e["telemetry_api_in_ms"] = 0
+                    e["telemetry_missing"] = 1
 
         with _METRICS_LOCK:
             _METRICS["consume_ok_total"] += 1
@@ -1102,8 +1138,8 @@ def consume_events_wait():
 
                 # Se ainda não chegou telemetria, espera um pouco e tenta de novo (evita perder SLA2)
                 if not t:
-                    for _ in range(20):          # 6 tentativas
-                        time.sleep(0.05)        # 50ms cada (total ~300ms máx)
+                    for _ in range(30):          # 30 x 50ms = ~1500ms
+                        time.sleep(0.05)
                         t = _telem_get(trader_key, s)
                         if t:
                             break
@@ -1112,6 +1148,11 @@ def consume_events_wait():
                     e["t_post_start_ms"] = int(t.get("t_post_start_ms", 0) or 0)
                     e["dt_post_ms"] = float(t.get("dt_post_ms", 0.0) or 0.0)
                     e["telemetry_api_in_ms"] = int(t.get("telemetry_api_in_ms", 0) or 0)
+                else:
+                    e["t_post_start_ms"] = 0
+                    e["dt_post_ms"] = 0.0
+                    e["telemetry_api_in_ms"] = 0
+                    e["telemetry_missing"] = 1
 
         if events_out:
             for e in events_out:
@@ -1189,16 +1230,23 @@ def consume_events_wait():
 
             # Retry curto (evita corrida publish x telemetry)
             if not t:
-                for _ in range(20):      # 6 tentativas
-                    time.sleep(0.05)    # 50ms cada (total ~300ms)
+                for _ in range(30):          # 30 x 50ms = ~1500ms
+                    time.sleep(0.05)
                     t = _telem_get(trader_key, s)
                     if t:
                         break
-
+             
             if t:
                 e["t_post_start_ms"] = int(t.get("t_post_start_ms", 0) or 0)
                 e["dt_post_ms"] = float(t.get("dt_post_ms", 0.0) or 0.0)
                 e["telemetry_api_in_ms"] = int(t.get("telemetry_api_in_ms", 0) or 0)
+
+            else:
+                # Garante campos no JSON mesmo sem telemetry (evita "sumir" dt_post_ms no FWEA)
+                e["t_post_start_ms"] = 0
+                e["dt_post_ms"] = 0.0
+                e["telemetry_api_in_ms"] = 0
+                e["telemetry_missing"] = 1
 
     if events_out:
         for e in events_out:
