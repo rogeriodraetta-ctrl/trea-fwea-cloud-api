@@ -1,13 +1,8 @@
 #!/usr/bin/env python3
 """
 TREA & FWEA – Cloud API
-<<<<<<< HEAD
-Versão: trea_fwea_cloud_api - 20260222_55
-Status: Premium SSE (base Pasta 58)
-=======
-Versão: trea_fwea_cloud_api - 20260228_56
+Versão: trea_fwea_cloud_api - 20260228_57
 Status: Premium SSE (base Pasta 63)
->>>>>>> 252e278 (Pasta 63 - WebSocket support (API WS endpoint + push on publish))
 
 Endpoints (v1):
   • POST /api/v1/events/publish        - recebe eventos do TREA (JSON)
@@ -929,6 +924,18 @@ def publish_event():
             with _METRICS_LOCK:
                 _METRICS["publish_ok_total"] += 1
                 _METRICS["publish_duplicate_total"] += 1
+
+            # WS push também no duplicate (para validar e para o FWEA poder ignorar se quiser)
+            evt["api_out_ms"] = int(time.time() * 1000)
+            try:
+                _ws_broadcast(trader_key, {
+                    "type": "event",
+                    "duplicate": True,
+                    "event": evt,
+                    "server_ts": evt.get("server_ts", int(time.time()))
+                })
+            except Exception:
+                pass
 
             return jsonify({
                 "ok": True,
