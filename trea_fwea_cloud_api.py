@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 TREA & FWEA – Cloud API
-Versão: trea_fwea_cloud_api - 20260228_57
-Status: Premium SSE (base Pasta 63)
+Versão: trea_fwea_cloud_api - 20260301_58
+Status: Premium SSE (base Pasta 64)
 
 Endpoints (v1):
   • POST /api/v1/events/publish        - recebe eventos do TREA (JSON)
@@ -31,8 +31,6 @@ from functools import wraps
 
 from flask import Flask, request, jsonify, Response, stream_with_context
 from flask_cors import CORS
-
-from flask_sock import Sock
 
 # ========================= Config =========================
 DEFAULT_TOKENS = ["TREA_MT5_DEV_TOKEN_001", "FWEA_MT5_DEV_TOKEN_001"]
@@ -91,71 +89,7 @@ logging.info(
 logging.getLogger("werkzeug").setLevel(logging.WARNING)
 
 app = Flask(__name__)
-sock = Sock(app)
 CORS(app, supports_credentials=False)
-
-# ======================== WS Hub ==========================
-WS_LOCK = threading.RLock()
-WS_CLIENTS = {}  # trader_key -> set(ws)
-
-def _ws_add(trader_key: str, ws):
-    with WS_LOCK:
-        s = WS_CLIENTS.get(trader_key)
-        if s is None:
-            s = set()
-            WS_CLIENTS[trader_key] = s
-        s.add(ws)
-
-def _ws_remove(trader_key: str, ws):
-    with WS_LOCK:
-        s = WS_CLIENTS.get(trader_key)
-        if not s:
-            return
-        if ws in s:
-            s.remove(ws)
-        if not s:
-            WS_CLIENTS.pop(trader_key, None)
-
-def _ws_broadcast(trader_key: str, payload: dict):
-    msg = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-    dead = []
-    with WS_LOCK:
-        targets = list(WS_CLIENTS.get(trader_key, set()))
-    for ws in targets:
-        try:
-            ws.send(msg)
-        except Exception:
-            dead.append(ws)
-    for ws in dead:
-        _ws_remove(trader_key, ws)
-
-def _get_token_from_ws_environ(ws) -> str:
-    env = getattr(ws, "environ", {}) or {}
-
-    # 1) Authorization: Bearer <token>
-    auth = env.get("HTTP_AUTHORIZATION", "") or ""
-    if auth.startswith("Bearer "):
-        return auth.split(" ", 1)[1].strip()
-
-    # 2) X-Api-Token
-    x = env.get("HTTP_X_API_TOKEN", "") or ""
-    if x.strip():
-        return x.strip()
-
-    # 3) DEV ONLY: ?token= (mesma regra da API)
-    if TFA_ALLOW_QUERY_TOKEN:
-        qs = env.get("QUERY_STRING", "") or ""
-        try:
-            params = parse_qs(qs, keep_blank_values=True)
-            if "token" in params and params["token"]:
-                return (params["token"][0] or "").strip()
-        except Exception:
-            pass
-
-    return ""
-
-def _ws_token_ok(token: str) -> bool:
-    return bool(token) and (token in VALID_TOKENS)
 
 # ========================= Storage ========================
 class EventStore:
@@ -786,62 +720,6 @@ def _shadow_xadd(evt: Dict[str, Any]) -> None:
     if not isinstance(r, dict) or not r.get("result"):
         logging.info("REDIS_SHADOW: XADD failed stream=%s id=%s err=%s", stream, evt.get("id"), r)
 
-@sock.route("/ws/events")
-def ws_events(ws):
-    """
-    Handshake:
-      - Token via Authorization: Bearer <token>
-      - ou X-Api-Token
-    Primeiro client message (JSON):
-      {"type":"subscribe","trader_key":"<...>","cursor":"0-0"}
-    """
-    token = _get_token_from_ws_environ(ws)
-    if not _ws_token_ok(token):
-        try:
-            ws.send(json.dumps({"ok": False, "error": "unauthorized"}))
-        except Exception:
-            pass
-        return
-
-    trader_key = ""
-    try:
-        raw = ws.receive()
-        if not raw:
-            return
-        msg = json.loads(raw)
-        if not isinstance(msg, dict) or msg.get("type") != "subscribe":
-            ws.send(json.dumps({"ok": False, "error": "bad_subscribe"}))
-            return
-
-        trader_key = str(msg.get("trader_key", "") or "").strip()
-        if not trader_key:
-            ws.send(json.dumps({"ok": False, "error": "missing_trader_key"}))
-            return
-
-        _ws_add(trader_key, ws)
-        ws.send(json.dumps({"ok": True, "type": "subscribed", "trader_key": trader_key}))
-    except Exception:
-        return
-
-    # loop: mantém conexão viva; responde ping; ignora msgs extras
-    while True:
-        try:
-            raw = ws.receive()
-            if raw is None:
-                break
-            if raw:
-                try:
-                    j = json.loads(raw)
-                    if isinstance(j, dict) and j.get("type") == "ping":
-                        ws.send(json.dumps({"type": "pong", "ts": int(time.time())}))
-                except Exception:
-                    pass
-        except Exception:
-            break
-
-    if trader_key:
-        _ws_remove(trader_key, ws)
-
 # ======================== Routes ==========================
 @app.get("/api/v1/health")
 def health():
@@ -919,23 +797,10 @@ def publish_event():
 
     if TFA_REDIS_STREAMS:
         is_new = _redis_set_dedupe_if_new(trader_key, event_id)
-
         if not is_new:
             with _METRICS_LOCK:
                 _METRICS["publish_ok_total"] += 1
                 _METRICS["publish_duplicate_total"] += 1
-
-            # WS push também no duplicate (para validar e para o FWEA poder ignorar se quiser)
-            evt["api_out_ms"] = int(time.time() * 1000)
-            try:
-                _ws_broadcast(trader_key, {
-                    "type": "event",
-                    "duplicate": True,
-                    "event": evt,
-                    "server_ts": evt.get("server_ts", int(time.time()))
-                })
-            except Exception:
-                pass
 
             return jsonify({
                 "ok": True,
@@ -957,27 +822,12 @@ def publish_event():
             }), 500
 
         try:
-            print(
-                f"API_PUBLISH_OK trader_key={trader_key} "
-                f"stream={r.get('stream')} redis_id={r.get('redis_id')}",
-                flush=True
-            )
+            print(f"API_PUBLISH_OK trader_key={trader_key} stream={r.get('stream')} redis_id={r.get('redis_id')}", flush=True)
         except Exception:
             pass
 
         with _METRICS_LOCK:
             _METRICS["publish_ok_total"] += 1
-
-        evt["api_out_ms"] = int(time.time() * 1000)
-        # WS push imediato (best-effort)
-        try:
-            _ws_broadcast(trader_key, {
-                "type": "event",
-                "event": {**evt, "_redis_id": r.get("redis_id")},
-                "server_ts": evt.get("server_ts", int(time.time()))
-            })
-        except Exception:
-            pass
 
         return jsonify({
             "ok": True,
@@ -991,6 +841,17 @@ def publish_event():
             "cloud_pub_ms": evt["cloud_pub_ms"],
         }), 200
 
+    STORE.add(evt)
+    return jsonify({
+        "ok": True,
+        "server_ms": int(time.time() * 1000),
+        "legacy": True,
+        "event_id": event_id,
+        "trader_key": trader_key,
+        "api_in_ms": evt.get("api_in_ms", 0),
+        "cloud_pub_ms": evt.get("cloud_pub_ms", 0),
+        "server_ts": evt.get("server_ts", 0),
+    }), 200
 
 @app.post("/api/v1/events/telemetry")
 @require_token_flexible
@@ -1134,6 +995,29 @@ def consume_events():
 
     if not trader_key:
         return jsonify({"ok": False, "error": "missing_trader_key"}), 400
+    
+    # Fallback sem Redis Streams (ex.: Linode sem Upstash)
+    if not TFA_REDIS_STREAMS:
+        try:
+            since_id = int(str(cursor).split("-")[0]) if cursor else 0
+        except Exception:
+            since_id = 0
+
+        events = STORE.since(since_id)
+        next_cursor = cursor
+        if events:
+            next_cursor = str(events[-1].get("id", since_id))
+
+        return jsonify({
+            "ok": True,
+            "server_ms": int(time.time() * 1000),
+            "legacy": True,
+            "trader_key": trader_key,
+            "cursor": cursor,
+            "next_cursor": next_cursor,
+            "events": events,
+            "waited_ms": 0
+        }), 200
 
     if TFA_REDIS_STREAMS:
         r = _redis_xread_events(trader_key, cursor, count)
@@ -1210,6 +1094,95 @@ def consume_events_wait():
 
     if not trader_key:
         return jsonify({"ok": False, "error": "missing_trader_key"}), 400
+
+    # ---------------------------------------------------------
+    # Fallback sem Redis Streams (ex.: Linode sem Upstash)
+    # ---------------------------------------------------------
+    if not TFA_REDIS_STREAMS:
+        # interpreta wait (segundos) / wait_ms (ms) semelhante ao caminho principal
+        try:
+            raw_wait_ms = request.args.get("wait_ms", None)
+            if raw_wait_ms is None:
+                raw_wait_ms = data.get("wait_ms", None)
+
+            if raw_wait_ms is not None and str(raw_wait_ms).strip() != "":
+                wait_ms = int(float(str(raw_wait_ms).strip()))
+            else:
+                raw_wait_s = request.args.get("wait", None)
+                if raw_wait_s is None:
+                    raw_wait_s = data.get("wait", None)
+
+                if raw_wait_s is None or str(raw_wait_s).strip() == "":
+                    wait_ms = int(TFA_CONSUME_WAIT_DEFAULT_MS)
+                else:
+                    wait_ms = int(float(str(raw_wait_s).strip()) * 1000.0)
+
+            wait_ms = max(0, min(wait_ms, int(TFA_CONSUME_WAIT_MAX_MS)))
+        except Exception:
+            wait_ms = int(TFA_CONSUME_WAIT_DEFAULT_MS)
+
+        # cursor=latest / $ -> começa do "tail" do STORE (anti-backlog)
+        if isinstance(cursor, str) and cursor.strip().lower() in ("latest", "$"):
+            try:
+                s = STORE.stats()
+                last_id = int(s.get("last_id", 0) or 0)
+            except Exception:
+                last_id = 0
+
+            return jsonify({
+                "ok": True,
+                "server_ms": int(time.time() * 1000),
+                "legacy": True,
+                "trader_key": trader_key,
+                "cursor": cursor,
+                "next_cursor": str(last_id),
+                "events": [],
+                "waited_ms": 0
+            }), 200
+
+        # long-poll simples no STORE
+        try:
+            since_id = int(str(cursor).split("-")[0]) if cursor else 0
+        except Exception:
+            since_id = 0
+
+        t0 = time.time()
+        waited_ms = 0
+
+        while True:
+            events = STORE.since(since_id)
+            if events:
+                next_cursor = str(events[-1].get("id", since_id))
+                return jsonify({
+                    "ok": True,
+                    "server_ms": int(time.time() * 1000),
+                    "legacy": True,
+                    "trader_key": trader_key,
+                    "cursor": cursor,
+                    "next_cursor": next_cursor,
+                    "events": events,
+                    "waited_ms": waited_ms
+                }), 200
+
+            if wait_ms <= 0:
+                break
+
+            waited_ms = int((time.time() - t0) * 1000)
+            if waited_ms >= wait_ms:
+                break
+
+            time.sleep(0.05)
+
+        return jsonify({
+            "ok": True,
+            "server_ms": int(time.time() * 1000),
+            "legacy": True,
+            "trader_key": trader_key,
+            "cursor": cursor,
+            "next_cursor": str(since_id),
+            "events": [],
+            "waited_ms": int((time.time() - t0) * 1000)
+        }), 200
 
     if isinstance(cursor, str) and cursor.strip().lower() in ("latest", "$"):
         stream = _stream_name(trader_key)
