@@ -1,0 +1,51 @@
+PASTA 104 — API v59 — revisão isolada para heartbeat
+
+Não implantada. Baseline v58 preservada. TREA e FWEA não modificados.
+
+Alteração: novo POST /api/v1/infra/heartbeat. Token exclusivo TFA_INFRA_TOKEN,
+sem valor padrão, enviado em Authorization: Bearer. Ausência de configuração:
+503; token inválido: 401; falha Redis: 503; gravação confirmada: 200.
+Grava apenas tts:infra:heartbeat, timestamp UTC, expiração de 3 dias.
+Não usa streams, sequências, dedupe, posições ou dados MT5. Não muda /health.
+Nenhum segredo é incluído no pacote ou em respostas de erro do endpoint.
+
+Implantação incremental:
+1. Gerar localmente token aleatório de 32 bytes e configurar TFA_INFRA_TOKEN
+   no Render, Linode e ambiente do agendador. Não compartilhar o valor no chat.
+2. Implantar esta revisão primeiramente em um serviço de teste. O nome de módulo
+   no comando Gunicorn deve corresponder ao arquivo implantado; se o repositório
+   usa trea_fwea_cloud_api.py, copiar a revisão para esse nome só na implantação.
+3. Confirmar os códigos 401/503 e 200; conferir a chave exclusiva no Redis.
+4. No Linode (ou outro agendador independente), executar heartbeat_check.py
+   diariamente com TTS_HEARTBEAT_URL apontando diretamente ao Render via HTTPS.
+   O endpoint da revisão também pode existir no Linode; se usado pelo agendador,
+   sua gravação mantém atividade Redis, mas não comprova disponibilidade Render.
+5. Configurar alerta do agendador para saída não zero ou execução diária ausente.
+   O script sozinho imprime falha; não envia e-mail nem configura cron/timer.
+6. Validar nova abertura/fechamento DEMO. Rollback: restaurar v58 e desativar job.
+
+O agendamento e alertas ainda precisam ser instalados no ambiente real.
+Não há garantia documental de que heartbeat evite a hibernação do plano:
+confirmar com Upstash se SET periódico reinicia o contador de inatividade.
+Não tentar reativação automática por credenciais administrativas nesta versão.
+O token deve permanecer em configuração protegida do servidor/agendador.
+O endpoint permite comandos por chamada autorizada: guardar o token e limitar
+acesso no proxy se houver. Não publicar token em URL.
+
+Alternância Render/Linode — planejamento, não implementada nesta revisão:
+Colocar proxy/balanceador independente na frente do domínio público; conferir
+DNS, TLS, URLs diretas e onde o proxy está instalado hoje. Ambos os backends
+precisam usar mesmo Redis, prefixes, tokens, TTLs e configurações operacionais.
+Evitar troca por uma única resposta lenta; usar timeout, falhas consecutivas e
+janela de recuperação. Limite definitivo depende das medições e long polling.
+Timeout de POST não prova que a ordem não foi gravada. A baseline faz SET NX
+antes de XADD: se XADD falhar, pode restar dedupe sem evento. Portanto ainda
+não habilitar reenvio automático de publicações para outro servidor. Projetar
+publicação/dedupe atômica e testar concorrência e resposta perdida em etapa
+separada. Não prometer exatamente uma execução apenas por ter mesmo código.
+Redis compartilhado continua ponto comum de falha; alternar API não o restaura.
+DNS isolado não garante troca por requisição por causa de caches dos clientes.
+
+Validação local: compilação Python e testes isolados do endpoint com respostas
+HTTP/Redis simuladas. Sem Flask instalado neste ambiente; não foi validado o
+carregamento completo da aplicação, Upstash real nem deploy Render/Linode.

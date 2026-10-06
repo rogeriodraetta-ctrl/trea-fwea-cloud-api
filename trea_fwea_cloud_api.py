@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
 TREA & FWEA – Cloud API
-Versão: trea_fwea_cloud_api - 20260301_58
-Status: Premium SSE (base Pasta 64)
+Versão: trea_fwea_cloud_api - 20261005_59
+Status: Premium SSE + heartbeat de infraestrutura (Pasta 104)
 
 Endpoints (v1):
   • POST /api/v1/events/publish        - recebe eventos do TREA (JSON)
   • GET  /api/v1/events/stream_ndjson  - entrega stream NDJSON para o FWEA
   • GET  /api/v1/health                - heartbeat (público)
+  • POST /api/v1/infra/heartbeat - verifica gravação no Redis; exige TFA_INFRA_TOKEN
 
 Segurança:
   • Authorization: Bearer <token> (OBRIGATÓRIO em PROD)
@@ -721,6 +722,42 @@ def _shadow_xadd(evt: Dict[str, Any]) -> None:
         logging.info("REDIS_SHADOW: XADD failed stream=%s id=%s err=%s", stream, evt.get("id"), r)
 
 # ======================== Routes ==========================
+# Pasta 104 v59: infraestrutura isolada; não altera o fluxo de eventos.
+# Token exclusivo de infraestrutura: não reutilizar tokens de EAs.
+@app.post("/api/v1/infra/heartbeat")
+def infra_heartbeat():
+    import hmac
+    expected = os.getenv("TFA_INFRA_TOKEN", "").strip()
+    supplied = request.headers.get("Authorization", "")
+    if not expected:
+        return jsonify({"ok": False, "error": "infra_disabled"}), 503
+    if not hmac.compare_digest(supplied, "Bearer " + expected):
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    if not UPSTASH_REDIS_REST_URL or not UPSTASH_REDIS_REST_TOKEN:
+        return jsonify({"ok": False, "error": "redis_not_configured"}), 503
+    started = time.monotonic()
+    stamp = int(time.time() * 1000)
+    try:
+        # Sessão independente; não modifica nem compartilha o cliente de copy trade.
+        response = requests.post(
+            UPSTASH_REDIS_REST_URL,
+            json=["SET", "tts:infra:heartbeat", str(stamp), "EX", "259200"],
+            headers={"Authorization": "Bearer " + UPSTASH_REDIS_REST_TOKEN},
+            timeout=(2.0, 5.0),
+        )
+        valid = response.status_code == 200 and response.json().get("result") == "OK"
+        if not valid:
+            raise ValueError("redis_write_rejected")
+    except Exception:
+        # Não devolve corpo upstream ou credenciais ao cliente/log.
+        print("API_INFRA_HEARTBEAT_FAILED", flush=True)
+        return jsonify({"ok": False, "error": "redis_unavailable"}), 503
+    print("API_INFRA_HEARTBEAT_OK", flush=True)
+    return jsonify({"ok": True, "redis_write_verified": True,
+                    "server_ms": stamp,
+                    "duration_ms": round((time.monotonic() - started) * 1000)})
+
+
 @app.get("/api/v1/health")
 def health():
     s = STORE.stats()
